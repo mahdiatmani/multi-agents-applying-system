@@ -1,0 +1,15 @@
+services:
+  apply-bot:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - APP_HOST=0.0.0.0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./state:/app/state
+      - ./CV.txt:/app/CV.txt
+      - ./credentials.json:/app/credentials.json:ro
+      - ./.env:/app/.env:ro
