@@ -67,6 +67,7 @@ def add_pending(profile_url: str, name: str, post_id: str, post_content: str, qu
             "sent_at": datetime.now().isoformat(),
             "status": "pending",
             "last_checked_at": None,
+            "accepted_at": None,
             "dm_sent_at": None,
         })
         today = str(date.today())
@@ -83,7 +84,10 @@ def list_items(status: str | None = None) -> list[dict]:
         return [it for it in items if it.get("status") == status]
 
 
-def update_status(profile_url: str, status: str, dm_sent: bool = False) -> None:
+def update_status(profile_url: str, status: str, dm_sent: bool = False, mark_accepted: bool = False) -> None:
+    """`mark_accepted=True` stamps an `accepted_at` timestamp the first time we
+    see a connection flip from pending → accepted. The sweeper uses this as the
+    ripening anchor — DM only fires once 10 min has passed since accepted_at."""
     if status not in VALID_STATUSES:
         return
     with LOCK:
@@ -93,6 +97,8 @@ def update_status(profile_url: str, status: str, dm_sent: bool = False) -> None:
             if it.get("profile_url") == profile_url:
                 it["status"] = status
                 it["last_checked_at"] = now
+                if mark_accepted and not it.get("accepted_at"):
+                    it["accepted_at"] = now
                 if dm_sent:
                     it["dm_sent_at"] = now
         _save(data)
@@ -116,3 +122,28 @@ def stats() -> dict:
 def reset() -> None:
     with LOCK:
         _save(_empty())
+
+
+def ripened_accepted_items(min_age_seconds: int) -> list[dict]:
+    """Return accepted entries whose accepted_at is at least min_age_seconds old.
+    These are ready to be DM'd. Items without accepted_at (legacy entries that
+    became accepted before this field existed) are treated as ripened."""
+    from datetime import datetime as _dt
+    now = _dt.now()
+    out: list[dict] = []
+    with LOCK:
+        data = _load()
+        for it in data["items"]:
+            if it.get("status") != "accepted":
+                continue
+            ts = it.get("accepted_at")
+            if not ts:
+                out.append(it)
+                continue
+            try:
+                ripe_age = (now - _dt.fromisoformat(ts)).total_seconds()
+            except Exception:
+                ripe_age = float("inf")
+            if ripe_age >= min_age_seconds:
+                out.append(it)
+    return out

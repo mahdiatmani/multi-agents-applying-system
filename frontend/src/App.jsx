@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, Fragment } from 'react';
+import { useState, useEffect, useRef, Fragment, useCallback } from 'react';
 import './index.css';
 
 const PlayIcon = () => (<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>);
@@ -16,6 +16,50 @@ const ActivityIcon = () => (<svg xmlns="http://www.w3.org/2000/svg" width="24" h
 
 const DEFAULT_LLM_MODEL = 'gpt-oss:120b-cloud';
 const SETTINGS_STORAGE_PREFIX = 'applyBot:';
+
+// Lightweight global event channel for backend-offline signaling.
+const backendStatus = {
+  online: true,
+  listeners: new Set(),
+  set(online) {
+    if (this.online === online) return;
+    this.online = online;
+    this.listeners.forEach(fn => { try { fn(online); } catch {} });
+  },
+  subscribe(fn) {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  },
+};
+
+// fetch wrapper: turns ECONNREFUSED (Vite's 503 {error:'backend_offline'}) and TypeError
+// (browser network failure) into a uniform thrown error AND flips backendStatus.
+async function apiFetch(input, init) {
+  try {
+    const res = await fetch(input, init);
+    if (res.status === 503) {
+      // Vite proxy says backend is down. Peek at body to confirm.
+      try {
+        const clone = res.clone();
+        const data = await clone.json();
+        if (data && data.error === 'backend_offline') {
+          backendStatus.set(false);
+          throw new Error('backend_offline');
+        }
+      } catch (e) {
+        if (e.message === 'backend_offline') throw e;
+      }
+    }
+    backendStatus.set(true);
+    return res;
+  } catch (err) {
+    // TypeError / network refused (when not running via Vite dev — e.g. served from FastAPI).
+    if (err && (err.name === 'TypeError' || err.message === 'backend_offline' || err.message === 'Failed to fetch')) {
+      backendStatus.set(false);
+    }
+    throw err;
+  }
+}
 
 function usePersistedState(key, initialValue) {
   const storageKey = SETTINGS_STORAGE_PREFIX + key;
@@ -58,7 +102,8 @@ const ACTION_TO_STAGE = {
   NETWORK: 'act', NETWORKED: 'act', NETWORK_FAILED: 'act',
   DRAFT_EMAIL: 'act', DRAFTED_EMAIL: 'act',
   DRAFT_DM: 'act', DRAFTED_DM: 'act', DRAFT_FAILED: 'act',
-  DRY_RUN_APPLY: 'act', DRY_RUN_NETWORK: 'act', DRY_RUN_EMAIL: 'act', DRY_RUN_DM: 'act',
+  EXTERNAL_LINK: 'act', EXTERNAL_LINK_RECORDED: 'act', EXTERNAL_LINK_FAILED: 'act',
+  DRY_RUN_APPLY: 'act', DRY_RUN_NETWORK: 'act', DRY_RUN_EMAIL: 'act', DRY_RUN_DM: 'act', DRY_RUN_LINK: 'act',
   EXTERNAL_LEAD: 'act',
   DONE: 'init',
 };
@@ -80,6 +125,10 @@ const ACTION_LABELS = {
   DRAFT_DM: 'Drafting DM',
   DRAFTED_DM: 'DM drafted',
   DRAFT_FAILED: 'Draft failed',
+  EXTERNAL_LINK: 'Apply link',
+  EXTERNAL_LINK_RECORDED: 'Apply link recorded',
+  EXTERNAL_LINK_FAILED: 'Apply link failed',
+  DRY_RUN_LINK: 'Dry-run: would record link',
   DRY_RUN_APPLY: 'Dry-run: would apply',
   DRY_RUN_NETWORK: 'Dry-run: would connect',
   DRY_RUN_EMAIL: 'Dry-run: would draft email',
@@ -133,11 +182,14 @@ function HumanQuestionModal({ question, onSubmit, onSkip }) {
   const [text, setText] = useState('');
   const [saveForFuture, setSaveForFuture] = useState(true);
   const [picked, setPicked] = useState([]);
-  useEffect(() => {
+  const [prevId, setPrevId] = useState(question?.id);
+
+  if (question?.id !== prevId) {
+    setPrevId(question?.id);
     setText('');
     setPicked([]);
     setSaveForFuture(true);
-  }, [question?.id]);
+  }
   if (!question) return null;
   const isMulti = question.kind === 'checkbox-group';
   const hasOptions = Array.isArray(question.options) && question.options.length > 0;
@@ -255,6 +307,7 @@ function TargetCard({ target }) {
   }
   const meta = [target.company, target.location].filter(Boolean).join(' · ');
   const summary = (target.summary || '').slice(0, 320);
+  const isPost = target.kind === 'Post';
   return (
     <div className="card target-card">
       <header>
@@ -265,9 +318,40 @@ function TargetCard({ target }) {
       {target.subtitle ? <p className="target-subtitle">{target.subtitle}</p> : null}
       {meta ? <p className="target-meta">{meta}</p> : null}
       {summary ? <p className="target-summary">{summary}{(target.summary || '').length > 320 ? '…' : ''}</p> : null}
-      {target.url ? (
-        <a className="target-link" href={target.url} target="_blank" rel="noreferrer">Open on LinkedIn ↗</a>
+      {isPost && (target.primary_email || target.attached_job_url) ? (
+        <div className="target-signals" style={{
+          display: 'flex', gap: '8px', flexWrap: 'wrap',
+          marginTop: '8px', fontSize: '0.8rem',
+        }}>
+          {target.primary_email ? (
+            <span style={{
+              background: 'rgba(16,185,129,0.15)', color: '#10b981',
+              padding: '2px 8px', borderRadius: '4px', fontWeight: 600,
+            }}>
+              ✉ {target.primary_email}
+            </span>
+          ) : null}
+          {target.attached_job_url ? (
+            <a href={target.attached_job_url} target="_blank" rel="noreferrer" style={{
+              background: 'rgba(99,102,241,0.15)', color: '#a5b4fc',
+              padding: '2px 8px', borderRadius: '4px', textDecoration: 'none',
+            }}>
+              📎 attached job ↗
+            </a>
+          ) : null}
+        </div>
       ) : null}
+      <div style={{ display: 'flex', gap: '12px', marginTop: '8px', flexWrap: 'wrap' }}>
+        {target.url ? (
+          <a className="target-link" href={target.url} target="_blank" rel="noreferrer">Open on LinkedIn ↗</a>
+        ) : null}
+        {isPost && target.author_url && target.author_url !== target.url ? (
+          <a className="target-link" href={target.author_url} target="_blank" rel="noreferrer">Open author profile ↗</a>
+        ) : null}
+        {isPost && target.post_url && target.post_url !== target.url ? (
+          <a className="target-link" href={target.post_url} target="_blank" rel="noreferrer">Permalink ↗</a>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -331,12 +415,16 @@ function LiveAgentView({ isRunning, logs, stats }) {
 
   let currentTarget = null;
   let lastDecision = null;
+  let lastPostBatch = null;
   for (let i = logs.length - 1; i >= 0; i--) {
-    const d = logs[i].detail;
-    if (!d) continue;
-    if (!currentTarget && (d.kind || d.title)) currentTarget = d;
-    if (!lastDecision && (d.recommended_action || d.match_score !== undefined)) lastDecision = d;
-    if (currentTarget && lastDecision) break;
+    const log = logs[i];
+    if (!lastPostBatch && log.post_batch) lastPostBatch = log.post_batch;
+    const d = log.detail;
+    if (d) {
+      if (!currentTarget && (d.kind || d.title)) currentTarget = d;
+      if (!lastDecision && (d.recommended_action || d.match_score !== undefined)) lastDecision = d;
+    }
+    if (currentTarget && lastDecision && lastPostBatch) break;
   }
 
   const recent = logs.filter(l => l.action && l.action !== 'PROCESSING').slice(-12).reverse();
@@ -357,6 +445,8 @@ function LiveAgentView({ isRunning, logs, stats }) {
 
       <PipelineDiagram stage={stage} />
 
+      {lastPostBatch ? <PostBatchStrip batch={lastPostBatch} /> : null}
+
       <StatsStrip stats={stats} />
 
       <div className="live-grid">
@@ -365,6 +455,31 @@ function LiveAgentView({ isRunning, logs, stats }) {
       </div>
 
       <TimelineFeed events={recent} />
+    </div>
+  );
+}
+
+function PostBatchStrip({ batch }) {
+  const depth = batch.queue_depth ?? 0;
+  const role = batch.batch_role || '';
+  return (
+    <div className="live-stats-strip" style={{ marginTop: '8px' }}>
+      <div className="strip-stat">
+        <span>Post batch</span>
+        <strong>{depth} queued</strong>
+      </div>
+      {role ? (
+        <div className="strip-stat">
+          <span>Scraped for</span>
+          <strong>hiring {role}</strong>
+        </div>
+      ) : null}
+      <div className="strip-stat" style={{ flex: 1, minWidth: '120px' }}>
+        <span>Flow</span>
+        <strong style={{ fontSize: '0.78rem', color: 'var(--text-muted)', fontWeight: 400 }}>
+          scrape feed → queue → evaluate one-by-one → apply / email / DM
+        </strong>
+      </div>
     </div>
   );
 }
@@ -527,8 +642,7 @@ function ProfileManager({ showToast, llmModel }) {
   const [isSaving, setIsSaving] = useState(false);
   const [isParsing, setIsParsing] = useState(false);
 
-  const load = () => {
-    setIsLoading(true);
+  const load = useCallback(() => {
     fetch('/api/profile')
       .then(r => r.json())
       .then(data => {
@@ -541,13 +655,13 @@ function ProfileManager({ showToast, llmModel }) {
       })
       .catch(() => showToast({ message: 'Failed to load profile.', type: 'error' }))
       .finally(() => setIsLoading(false));
-  };
+  }, [showToast]);
 
   useEffect(() => {
     load();
-    profileReloadHandle = load;
-    return () => { if (profileReloadHandle === load) profileReloadHandle = null; };
-  }, []);
+    profileReloadHandle = () => { setIsLoading(true); load(); };
+    return () => { profileReloadHandle = null; };
+  }, [load]);
 
   const handleReparse = async () => {
     setIsParsing(true);
@@ -752,7 +866,9 @@ function MainContent({ isRunning, stats, details, activeDetails, setActiveDetail
             : currentTab === 'live'    ? 'Live Agent View'
             : currentTab === 'profile' ? 'Applicant Profile'
             : currentTab === 'qa'      ? 'Form Q&A Overrides'
-            : 'CV Manager'
+            : currentTab === 'cv'      ? 'CV Manager'
+            : currentTab === 'outreach' ? 'Outreach Tracker'
+            : 'External Leads'
           }</h1>
           <div className="tabs">
             <button className={`tab ${currentTab === 'dashboard' ? 'active' : ''}`} onClick={() => setCurrentTab('dashboard')}>Dashboard</button>
@@ -760,6 +876,8 @@ function MainContent({ isRunning, stats, details, activeDetails, setActiveDetail
             <button className={`tab ${currentTab === 'profile' ? 'active' : ''}`}   onClick={() => setCurrentTab('profile')}>Profile</button>
             <button className={`tab ${currentTab === 'qa' ? 'active' : ''}`}        onClick={() => setCurrentTab('qa')}>Form Q&A</button>
             <button className={`tab ${currentTab === 'cv' ? 'active' : ''}`}        onClick={() => setCurrentTab('cv')}>CV Manager</button>
+            <button className={`tab ${currentTab === 'outreach' ? 'active' : ''}`}  onClick={() => setCurrentTab('outreach')}>Outreach</button>
+            <button className={`tab ${currentTab === 'leads' ? 'active' : ''}`}     onClick={() => setCurrentTab('leads')}>Leads</button>
           </div>
         </div>
         <div className="status-badge" style={{ borderColor: isRunning ? 'var(--border)' : 'transparent' }}>
@@ -815,12 +933,634 @@ function MainContent({ isRunning, stats, details, activeDetails, setActiveDetail
         <ProfileManager showToast={showToast} llmModel={llmModel} />
       ) : currentTab === 'qa' ? (
         <QAOverridesManager showToast={showToast} />
-      ) : (
+      ) : currentTab === 'cv' ? (
         <CVManager llmModel={llmModel} showToast={showToast} />
+      ) : currentTab === 'outreach' ? (
+        <OutreachManager showToast={showToast} />
+      ) : (
+        <ExternalLeadsManager showToast={showToast} />
       )}
     </main>
   );
 }
+
+
+function OutreachManager({ showToast }) {
+  const [emails, setEmails] = useState({ items: [], stats: {} });
+  const [links, setLinks] = useState({ items: [], stats: {} });
+  const [connections, setConnections] = useState({ items: [], stats: {} });
+  const [gmailAuthed, setGmailAuthed] = useState(true);
+  const [section, setSection] = useState('emails');
+  const [loading, setLoading] = useState(true);
+
+  const fetchAll = async () => {
+    setLoading(true);
+    try {
+      const r = await fetch('/api/outreach');
+      const data = await r.json();
+      setGmailAuthed(data.gmail_authed !== false);
+      setEmails(data.emails || { items: [], stats: {} });
+      setLinks(data.links || { items: [], stats: {} });
+      setConnections(data.connections || { items: [], stats: {} });
+    } catch (err) {
+      showToast?.({ message: `Failed to load outreach: ${err.message}`, type: 'error' });
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => { fetchAll(); }, []);
+
+  const setEmailStatus = async (item, status) => {
+    const identifier = item.to_email || item.post_url;
+    try {
+      await fetch('/api/outreach/emails/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier, status }),
+      });
+      await fetchAll();
+    } catch (err) {
+      showToast?.({ message: `Status update failed: ${err.message}`, type: 'error' });
+    }
+  };
+
+  const removeEmail = async (item) => {
+    if (!window.confirm(`Remove draft to ${item.to_email}?`)) return;
+    const identifier = item.to_email || item.post_url;
+    try {
+      await fetch('/api/outreach/emails/remove', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier }),
+      });
+      await fetchAll();
+    } catch (err) {
+      showToast?.({ message: `Remove failed: ${err.message}`, type: 'error' });
+    }
+  };
+
+  const clearEmails = async () => {
+    if (!emails.items.length) return;
+    if (!window.confirm(`Delete all ${emails.items.length} drafted email(s)? Gmail drafts will NOT be deleted — only the local tracking record.`)) return;
+    try {
+      await fetch('/api/outreach/emails/clear', { method: 'POST' });
+      await fetchAll();
+      showToast?.({ message: 'Email tracking cleared.', type: 'success' });
+    } catch (err) {
+      showToast?.({ message: `Clear failed: ${err.message}`, type: 'error' });
+    }
+  };
+
+  const setLinkStatus = async (item, status) => {
+    const identifier = item.apply_url || item.post_url;
+    try {
+      await fetch('/api/outreach/links/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier, status }),
+      });
+      await fetchAll();
+    } catch (err) {
+      showToast?.({ message: `Status update failed: ${err.message}`, type: 'error' });
+    }
+  };
+
+  const removeLink = async (item) => {
+    if (!window.confirm(`Remove apply-link for ${item.post_author || 'this post'}?`)) return;
+    const identifier = item.apply_url || item.post_url;
+    try {
+      await fetch('/api/outreach/links/remove', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier }),
+      });
+      await fetchAll();
+    } catch (err) {
+      showToast?.({ message: `Remove failed: ${err.message}`, type: 'error' });
+    }
+  };
+
+  const clearLinks = async () => {
+    if (!links.items.length) return;
+    if (!window.confirm(`Delete all ${links.items.length} apply-link record(s)?`)) return;
+    try {
+      await fetch('/api/outreach/links/clear', { method: 'POST' });
+      await fetchAll();
+      showToast?.({ message: 'Apply-link tracking cleared.', type: 'success' });
+    } catch (err) {
+      showToast?.({ message: `Clear failed: ${err.message}`, type: 'error' });
+    }
+  };
+
+  const emailStats = emails.stats || {};
+  const linkStats = links.stats || {};
+  const connStats = connections.stats || {};
+
+  return (
+    <div className="card" style={{ padding: '1rem', marginTop: '1rem' }}>
+      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.8rem', flexWrap: 'wrap', gap: '8px' }}>
+        <div>
+          <h3 style={{ margin: 0 }}>Outreach Tracker</h3>
+          <p style={{ margin: '4px 0 0', color: 'var(--text-muted)', fontSize: '0.82rem' }}>
+            Every email draft + every connection request + every queued/sent DM the bot has produced.
+          </p>
+        </div>
+        <button className="btn secondary" onClick={fetchAll} style={{ margin: 0, padding: '0.4rem 0.8rem', fontSize: '0.85rem' }}>Refresh</button>
+      </header>
+
+      {!gmailAuthed ? (
+        <div style={{
+          background: 'rgba(239, 68, 68, 0.12)', border: '1px solid #ef4444',
+          color: '#fecaca', padding: '10px 12px', borderRadius: '6px',
+          marginBottom: '12px', fontSize: '0.85rem',
+        }}>
+          <strong>⚠ Gmail not connected</strong> — the bot will still <em>decide</em> to draft emails
+          based on hiring posts, and the bodies will appear here under "Emails drafted" with status
+          <code style={{ background: 'rgba(0,0,0,0.25)', padding: '0 6px', borderRadius: '3px', margin: '0 4px' }}>gmail_unauth</code>
+          so you can copy them. To get Gmail to actually create the drafts, run
+          <code style={{ background: 'rgba(0,0,0,0.25)', padding: '0 6px', borderRadius: '3px', margin: '0 4px' }}>python setup_auth.py</code>
+          locally and restart the server.
+        </div>
+      ) : null}
+
+      <div style={{ display: 'flex', gap: '8px', marginBottom: '12px', flexWrap: 'wrap' }}>
+        <button
+          className={`tab ${section === 'emails' ? 'active' : ''}`}
+          onClick={() => setSection('emails')}
+          style={{ padding: '0.35rem 0.8rem', fontSize: '0.85rem' }}
+        >
+          ✉ Emails drafted ({emailStats.total || 0})
+        </button>
+        <button
+          className={`tab ${section === 'links' ? 'active' : ''}`}
+          onClick={() => setSection('links')}
+          style={{ padding: '0.35rem 0.8rem', fontSize: '0.85rem' }}
+        >
+          🔗 Apply via link ({linkStats.total || 0})
+        </button>
+        <button
+          className={`tab ${section === 'pending' ? 'active' : ''}`}
+          onClick={() => setSection('pending')}
+          style={{ padding: '0.35rem 0.8rem', fontSize: '0.85rem' }}
+        >
+          ⏳ Pending ({connStats.pending || 0})
+        </button>
+        <button
+          className={`tab ${section === 'ripening' ? 'active' : ''}`}
+          onClick={() => setSection('ripening')}
+          style={{ padding: '0.35rem 0.8rem', fontSize: '0.85rem' }}
+        >
+          🕒 Accepted (DM ripening) ({connStats.accepted || 0})
+        </button>
+        <button
+          className={`tab ${section === 'dms' ? 'active' : ''}`}
+          onClick={() => setSection('dms')}
+          style={{ padding: '0.35rem 0.8rem', fontSize: '0.85rem' }}
+        >
+          💬 DMs sent ({connStats.dm_sent || 0})
+        </button>
+        <button
+          className={`tab ${section === 'failed' ? 'active' : ''}`}
+          onClick={() => setSection('failed')}
+          style={{ padding: '0.35rem 0.8rem', fontSize: '0.85rem' }}
+        >
+          ⚠ Failed ({connStats.dm_failed || 0})
+        </button>
+      </div>
+
+      {loading ? <p style={{ color: 'var(--text-muted)' }}>Loading…</p> : null}
+
+      {!loading && section === 'emails' ? (
+        <OutreachEmailsList
+          items={emails.items}
+          onSetStatus={setEmailStatus}
+          onRemove={removeEmail}
+          onClear={clearEmails}
+        />
+      ) : null}
+
+      {!loading && section === 'links' ? (
+        <OutreachLinksList
+          items={links.items}
+          onSetStatus={setLinkStatus}
+          onRemove={removeLink}
+          onClear={clearLinks}
+        />
+      ) : null}
+
+      {!loading && section === 'pending' ? (
+        <OutreachConnectionsList items={connections.items} filter="pending" />
+      ) : null}
+
+      {!loading && section === 'ripening' ? (
+        <OutreachConnectionsList items={connections.items} filter="accepted" />
+      ) : null}
+
+      {!loading && section === 'dms' ? (
+        <OutreachConnectionsList items={connections.items} filter="dm_sent" />
+      ) : null}
+
+      {!loading && section === 'failed' ? (
+        <OutreachConnectionsList items={connections.items} filter="dm_failed" />
+      ) : null}
+    </div>
+  );
+}
+
+
+function OutreachLinksList({ items, onSetStatus, onRemove, onClear }) {
+  const statusColor = (s) => ({
+    new: '#3b82f6', opened: '#a78bfa', applied: '#10b981', dismissed: 'var(--text-muted)',
+  }[s] || 'var(--text-muted)');
+
+  if (!items.length) {
+    return (
+      <p style={{ color: 'var(--text-muted)' }}>
+        No apply-via-link posts yet. When the bot finds a hiring post that says
+        "apply at &lt;url&gt;" or attaches an external ATS link, it lands here for you to open manually.
+      </p>
+    );
+  }
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '8px' }}>
+        <button className="btn secondary" onClick={onClear} style={{ margin: 0, padding: '0.35rem 0.7rem', fontSize: '0.78rem' }}>Clear all</button>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        {items.map((it) => {
+          const id = it.apply_url || it.post_url;
+          const hostname = (() => { try { return new URL(it.apply_url).hostname.replace(/^www\./, ''); } catch { return it.apply_url; } })();
+          return (
+            <div key={id} style={{
+              border: '1px solid var(--border)', borderRadius: '6px',
+              padding: '10px 12px', background: 'var(--surface)',
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', alignItems: 'flex-start' }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    <span style={{ color: statusColor(it.status), fontWeight: 600, fontSize: '0.72rem', textTransform: 'uppercase' }}>{it.status}</span>
+                    <strong>{it.post_author || 'Unknown author'}</strong>
+                    {it.match_score != null ? (
+                      <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>· score {it.match_score}/100</span>
+                    ) : null}
+                  </div>
+                  <div style={{ marginTop: '4px', fontSize: '0.92rem' }}>
+                    <a href={it.apply_url} target="_blank" rel="noreferrer" style={{ color: '#60a5fa', fontWeight: 600 }}>
+                      ↗ Apply on {hostname}
+                    </a>
+                  </div>
+                  <div style={{ marginTop: '2px', fontSize: '0.78rem', color: 'var(--text-muted)', wordBreak: 'break-all' }}>
+                    {it.apply_url}
+                  </div>
+                  {it.post_excerpt ? (
+                    <div style={{ marginTop: '6px', fontSize: '0.78rem', color: 'var(--text-muted)', fontStyle: 'italic' }}>
+                      "{it.post_excerpt.slice(0, 260)}{it.post_excerpt.length > 260 ? '…' : ''}"
+                    </div>
+                  ) : null}
+                  <div style={{ marginTop: '4px', fontSize: '0.78rem', display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                    {it.post_url ? (
+                      <a href={it.post_url} target="_blank" rel="noreferrer" style={{ color: '#60a5fa' }}>↗ original post</a>
+                    ) : null}
+                  </div>
+                  <div style={{ marginTop: '2px', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                    captured {it.captured_at?.slice(0, 19).replace('T', ' ')}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', alignItems: 'stretch' }}>
+                  {it.status !== 'opened' && (
+                    <button className="btn secondary" onClick={() => onSetStatus(it, 'opened')} style={{ margin: 0, padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}>👁 opened</button>
+                  )}
+                  {it.status !== 'applied' && (
+                    <button className="btn secondary" onClick={() => onSetStatus(it, 'applied')} style={{ margin: 0, padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}>✓ applied</button>
+                  )}
+                  {it.status !== 'dismissed' && (
+                    <button className="btn secondary" onClick={() => onSetStatus(it, 'dismissed')} style={{ margin: 0, padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}>dismiss</button>
+                  )}
+                  <button className="btn secondary" onClick={() => onRemove(it)} style={{ margin: 0, padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}>🗑</button>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
+function OutreachEmailsList({ items, onSetStatus, onRemove, onClear }) {
+  const statusColor = (s) => ({
+    drafted: '#3b82f6', sent: '#10b981', replied: '#a78bfa', ignored: 'var(--text-muted)',
+    gmail_unauth: '#ef4444', gmail_failed: '#ef4444',
+  }[s] || 'var(--text-muted)');
+  const statusLabel = (s) => ({
+    gmail_unauth: 'GMAIL AUTH NEEDED',
+    gmail_failed: 'GMAIL ERROR',
+  }[s] || s?.toUpperCase());
+
+  if (!items.length) {
+    return <p style={{ color: 'var(--text-muted)' }}>No email drafts yet. The bot will record one here every time it creates a Gmail draft from a post.</p>;
+  }
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '8px' }}>
+        <button className="btn secondary" onClick={onClear} style={{ margin: 0, padding: '0.35rem 0.7rem', fontSize: '0.78rem' }}>Clear all</button>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        {items.map((it) => {
+          const id = it.to_email || it.post_url;
+          return (
+            <div key={id} style={{
+              border: '1px solid var(--border)', borderRadius: '6px',
+              padding: '10px 12px', background: 'var(--surface)',
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', alignItems: 'flex-start' }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    <span style={{ color: statusColor(it.status), fontWeight: 600, fontSize: '0.72rem' }}>{statusLabel(it.status)}</span>
+                    <strong>{it.to_email}</strong>
+                    {it.match_score != null ? (
+                      <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>· score {it.match_score}/100</span>
+                    ) : null}
+                  </div>
+                  {it.error ? (
+                    <div style={{ marginTop: '2px', fontSize: '0.72rem', color: '#ef4444' }}>
+                      {it.error}
+                    </div>
+                  ) : null}
+                  <div style={{ marginTop: '4px', fontSize: '0.82rem' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>from post by</span>{' '}
+                    <strong>{it.post_author || 'unknown'}</strong>
+                  </div>
+                  {it.subject ? (
+                    <div style={{ marginTop: '4px', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                      Subject: {it.subject}
+                    </div>
+                  ) : null}
+                  {it.post_excerpt ? (
+                    <div style={{ marginTop: '4px', fontSize: '0.78rem', color: 'var(--text-muted)', fontStyle: 'italic' }}>
+                      "{it.post_excerpt.slice(0, 220)}{it.post_excerpt.length > 220 ? '…' : ''}"
+                    </div>
+                  ) : null}
+                  <details style={{ marginTop: '6px' }}>
+                    <summary style={{ cursor: 'pointer', color: 'var(--text-muted)', fontSize: '0.78rem' }}>Show drafted body</summary>
+                    <pre style={{
+                      background: '#0b0b0e', color: '#e2e8f0', padding: '10px',
+                      borderRadius: '4px', overflowX: 'auto', fontSize: '0.78rem',
+                      whiteSpace: 'pre-wrap', marginTop: '6px', maxHeight: '300px',
+                      overflowY: 'auto',
+                    }}>{it.body}</pre>
+                  </details>
+                  <div style={{ marginTop: '4px', fontSize: '0.78rem', display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                    {it.post_url ? (
+                      <a href={it.post_url} target="_blank" rel="noreferrer" style={{ color: '#60a5fa' }}>↗ original post</a>
+                    ) : null}
+                    <a href="https://mail.google.com/mail/u/0/#drafts" target="_blank" rel="noreferrer" style={{ color: '#60a5fa' }}>↗ open Gmail drafts</a>
+                  </div>
+                  <div style={{ marginTop: '2px', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                    created {it.created_at?.slice(0, 19).replace('T', ' ')}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', alignItems: 'stretch' }}>
+                  {it.status !== 'sent' && (
+                    <button className="btn secondary" onClick={() => onSetStatus(it, 'sent')} style={{ margin: 0, padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}>✓ sent</button>
+                  )}
+                  {it.status !== 'replied' && (
+                    <button className="btn secondary" onClick={() => onSetStatus(it, 'replied')} style={{ margin: 0, padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}>↩ replied</button>
+                  )}
+                  {it.status !== 'ignored' && (
+                    <button className="btn secondary" onClick={() => onSetStatus(it, 'ignored')} style={{ margin: 0, padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}>ignore</button>
+                  )}
+                  <button className="btn secondary" onClick={() => onRemove(it)} style={{ margin: 0, padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}>🗑</button>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
+function OutreachConnectionsList({ items, filter }) {
+  const filtered = items.filter(it => it.status === filter);
+  const statusColor = (s) => ({
+    pending: '#f59e0b', accepted: '#10b981', dm_sent: '#10b981',
+    dm_failed: '#ef4444', declined: 'var(--text-muted)',
+  }[s] || 'var(--text-muted)');
+
+  const emptyMessage = {
+    pending: 'No pending connection requests. The bot queues one here every time it sends a connect-without-note from a post.',
+    accepted: 'No accepted connections waiting on a DM. After an invite is accepted, it ripens for 10 minutes here before the sweeper sends the queued DM.',
+    dm_sent: 'No DMs sent yet. The pending sweeper sends each queued DM after the recipient accepts the connection.',
+    dm_failed: 'No failed DMs.',
+  };
+
+  if (!filtered.length) {
+    return <p style={{ color: 'var(--text-muted)' }}>{emptyMessage[filter] || 'No items.'}</p>;
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+      {filtered.map((it) => (
+        <div key={it.profile_url} style={{
+          border: '1px solid var(--border)', borderRadius: '6px',
+          padding: '10px 12px', background: 'var(--surface)',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            <span style={{ color: statusColor(it.status), fontWeight: 600, fontSize: '0.72rem', textTransform: 'uppercase' }}>{it.status}</span>
+            <strong>{it.name || 'Unknown'}</strong>
+            {it.dm_sent ? <span style={{ fontSize: '0.72rem', color: '#10b981' }}>✓ DM delivered</span> : null}
+          </div>
+          {it.post_content ? (
+            <div style={{ marginTop: '4px', fontSize: '0.78rem', color: 'var(--text-muted)', fontStyle: 'italic' }}>
+              "{it.post_content.slice(0, 220)}{it.post_content.length > 220 ? '…' : ''}"
+            </div>
+          ) : null}
+          {it.queued_dm ? (
+            <details style={{ marginTop: '6px' }}>
+              <summary style={{ cursor: 'pointer', color: 'var(--text-muted)', fontSize: '0.78rem' }}>
+                {it.status === 'dm_sent' ? 'Show DM that was sent' : 'Show DM queued for after acceptance'}
+              </summary>
+              <pre style={{
+                background: '#0b0b0e', color: '#e2e8f0', padding: '10px',
+                borderRadius: '4px', overflowX: 'auto', fontSize: '0.78rem',
+                whiteSpace: 'pre-wrap', marginTop: '6px',
+              }}>{it.queued_dm}</pre>
+            </details>
+          ) : null}
+          <div style={{ marginTop: '4px', fontSize: '0.78rem', display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+            {it.profile_url ? (
+              <a href={it.profile_url} target="_blank" rel="noreferrer" style={{ color: '#60a5fa' }}>↗ profile</a>
+            ) : null}
+          </div>
+          <div style={{ marginTop: '2px', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+            queued {it.queued_at?.slice(0, 19).replace('T', ' ')}
+            {it.last_checked_at ? ` · last checked ${it.last_checked_at.slice(0, 19).replace('T', ' ')}` : ''}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
+function ExternalLeadsManager({ showToast }) {
+  const [items, setItems] = useState([]);
+  const [stats, setStats] = useState({ total: 0, new: 0, viewed: 0, applied: 0, dismissed: 0 });
+  const [filter, setFilter] = useState('all');
+  const [loading, setLoading] = useState(true);
+
+  const fetchAll = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch('/api/external-leads');
+      const data = await res.json();
+      setItems(data.items || []);
+      setStats(data.stats || {});
+    } catch (err) {
+      showToast?.({ message: `Failed to load leads: ${err.message}`, type: 'error' });
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => { fetchAll(); }, []);
+
+  const setStatus = async (lead, status) => {
+    const id = lead.job_identifier || lead.url;
+    try {
+      await fetch('/api/external-leads/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier: id, status }),
+      });
+      await fetchAll();
+    } catch (err) {
+      showToast?.({ message: `Status update failed: ${err.message}`, type: 'error' });
+    }
+  };
+
+  const removeLead = async (lead) => {
+    const id = lead.job_identifier || lead.url;
+    if (!window.confirm(`Remove "${lead.title || lead.url}" from leads?`)) return;
+    try {
+      await fetch('/api/external-leads/remove', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier: id }),
+      });
+      await fetchAll();
+    } catch (err) {
+      showToast?.({ message: `Remove failed: ${err.message}`, type: 'error' });
+    }
+  };
+
+  const clearAll = async () => {
+    if (!items.length) return;
+    if (!window.confirm(`Delete all ${items.length} lead(s)? This cannot be undone.`)) return;
+    try {
+      await fetch('/api/external-leads/clear', { method: 'POST' });
+      await fetchAll();
+      showToast?.({ message: 'Leads cleared.', type: 'success' });
+    } catch (err) {
+      showToast?.({ message: `Clear failed: ${err.message}`, type: 'error' });
+    }
+  };
+
+  const filtered = filter === 'all' ? items : items.filter(it => it.status === filter);
+  const statusColor = (s) => ({
+    new: '#3b82f6', viewed: '#a78bfa', applied: '#10b981', dismissed: 'var(--text-muted)'
+  }[s] || 'var(--text-muted)');
+
+  return (
+    <div className="card" style={{ padding: '1rem', marginTop: '1rem' }}>
+      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.8rem', flexWrap: 'wrap', gap: '8px' }}>
+        <div>
+          <h3 style={{ margin: 0 }}>External-ATS Leads ({stats.total || 0})</h3>
+          <p style={{ margin: '4px 0 0', color: 'var(--text-muted)', fontSize: '0.82rem' }}>
+            Jobs the bot couldn't Easy-Apply (external redirect or modal that never opened). Apply manually.
+          </p>
+        </div>
+        <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+          <select value={filter} onChange={(e) => setFilter(e.target.value)} style={{
+            background: 'var(--background)', color: 'var(--text-main)',
+            border: '1px solid var(--border)', padding: '0.35rem 0.6rem',
+            borderRadius: '6px', fontSize: '0.82rem',
+          }}>
+            <option value="all">all ({stats.total || 0})</option>
+            <option value="new">new ({stats.new || 0})</option>
+            <option value="viewed">viewed ({stats.viewed || 0})</option>
+            <option value="applied">applied ({stats.applied || 0})</option>
+            <option value="dismissed">dismissed ({stats.dismissed || 0})</option>
+          </select>
+          <button className="btn secondary" onClick={fetchAll} style={{ margin: 0, padding: '0.4rem 0.8rem', fontSize: '0.85rem' }}>Refresh</button>
+          <button className="btn secondary" onClick={clearAll} disabled={!items.length} style={{ margin: 0, padding: '0.4rem 0.8rem', fontSize: '0.85rem' }}>Clear all</button>
+        </div>
+      </header>
+
+      {loading ? <p style={{ color: 'var(--text-muted)' }}>Loading…</p> : null}
+      {!loading && filtered.length === 0 ? (
+        <p style={{ color: 'var(--text-muted)' }}>No leads in this view.</p>
+      ) : null}
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        {filtered.map((lead) => {
+          const linkedinUrl = lead.url || '';
+          const externalUrl = lead.destination_url || '';
+          const id = lead.job_identifier || lead.url;
+          return (
+            <div key={id} style={{
+              border: '1px solid var(--border)', borderRadius: '6px',
+              padding: '10px 12px', background: 'var(--surface)',
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '8px' }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    <span style={{ color: statusColor(lead.status), fontWeight: 600, fontSize: '0.72rem', textTransform: 'uppercase' }}>
+                      {lead.status}
+                    </span>
+                    <strong>{lead.title || 'Untitled'}</strong>
+                    {lead.company ? <span style={{ color: 'var(--text-muted)' }}>· {lead.company}</span> : null}
+                  </div>
+                  <div style={{ marginTop: '4px', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                    {lead.reason || ''}
+                  </div>
+                  <div style={{ marginTop: '4px', fontSize: '0.82rem', display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                    {linkedinUrl ? (
+                      <a href={linkedinUrl} target="_blank" rel="noreferrer" style={{ color: '#60a5fa' }}>↗ LinkedIn</a>
+                    ) : null}
+                    {externalUrl ? (
+                      <a href={externalUrl} target="_blank" rel="noreferrer" style={{ color: '#60a5fa' }}>
+                        ↗ {externalUrl.replace(/^https?:\/\//, '').slice(0, 60)}
+                      </a>
+                    ) : null}
+                  </div>
+                  <div style={{ marginTop: '2px', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                    captured {lead.captured_at?.slice(0, 19).replace('T', ' ')}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', alignItems: 'stretch' }}>
+                  {lead.status !== 'applied' && (
+                    <button className="btn secondary" onClick={() => setStatus(lead, 'applied')} style={{ margin: 0, padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}>✓ applied</button>
+                  )}
+                  {lead.status !== 'viewed' && lead.status !== 'applied' && (
+                    <button className="btn secondary" onClick={() => setStatus(lead, 'viewed')} style={{ margin: 0, padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}>viewed</button>
+                  )}
+                  {lead.status !== 'dismissed' && (
+                    <button className="btn secondary" onClick={() => setStatus(lead, 'dismissed')} style={{ margin: 0, padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}>dismiss</button>
+                  )}
+                  <button className="btn secondary" onClick={() => removeLead(lead)} style={{ margin: 0, padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}>🗑</button>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 
 function QAOverridesManager({ showToast }) {
   const [entries, setEntries] = useState([]);
@@ -934,6 +1674,7 @@ export default function Root() {
   const [isRunning, setIsRunning] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [pendingQuestion, setPendingQuestion] = useState(null);
+  const [backendOnline, setBackendOnline] = useState(true);
   const [logs, setLogs] = useState([{ message: 'System initialized. Awaiting commands.', type: 'system', time: new Date().toLocaleTimeString() }]);
 
   const [stats, setStats] = useState({ jobsSearched: 0, profilesFound: 0, applicationsSent: 0, draftsCreated: 0 });
@@ -943,6 +1684,10 @@ export default function Root() {
 
   const eventSourceRef = useRef(null);
   const logsEndRef = useRef(null);
+  // Guard so the mount-time log replay + SSE reattach only runs once. loadAll()
+  // is also called on a 4s retry while the backend is offline; without this guard
+  // every successful retry would re-replay the buffer and double-log everything.
+  const initialRecoveryDoneRef = useRef(false);
 
   const showToast = (t) => setToast(t);
 
@@ -957,24 +1702,134 @@ export default function Root() {
       .catch(() => setLoginStatus(false));
   };
 
+  // Single SSE-message handler used by both the live stream (startAgent) and
+  // mount-time replay (loadAll). `isReplay=true` skips client-side stats
+  // increments because /api/db already reflects the final post-run counts —
+  // re-incrementing on replay would inflate the dashboard tiles.
+  const handleLogPayload = (data, { isReplay = false } = {}) => {
+    if (data.action === 'PAUSED') setIsPaused(true);
+    else if (data.action === 'RESUMED') setIsPaused(false);
+    else if (data.action === 'ASK_HUMAN' && data.question) setPendingQuestion(data.question);
+    else if (data.action === 'ANSWER_HUMAN') setPendingQuestion(prev => (prev && prev.id === data.question_id ? null : prev));
+
+    addLog(data.message, data.type || 'info', {
+      action: data.action,
+      detail: data.detail,
+      post_batch: data.post_batch,
+    });
+
+    if (data.detail) {
+      setActivityDetails(prev => {
+        const bucket = data.detail.kind === 'Job' ? 'jobs' : 'profilesPosts';
+        return { ...prev, [bucket]: upsertDetail(prev[bucket], data.detail, data.action) };
+      });
+    }
+
+    if (!isReplay) {
+      if (data.action === 'SEARCHED_JOB' && data.detail) {
+        setStats(s => ({ ...s, jobsSearched: s.jobsSearched + 1 }));
+      } else if ((data.action === 'SEARCHED_PERSON' || data.action === 'SEARCHED_POST') && data.detail) {
+        setStats(s => ({ ...s, profilesFound: s.profilesFound + 1 }));
+      } else if (data.action === 'APPLIED') {
+        setStats(s => ({ ...s, applicationsSent: s.applicationsSent + 1 }));
+      } else if (data.action === 'DRAFTED_EMAIL' || data.action === 'DRAFTED_DM') {
+        setStats(s => ({ ...s, draftsCreated: s.draftsCreated + 1 }));
+      }
+    }
+
+    if (data.action === 'DONE') {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+      setIsRunning(false);
+    }
+  };
+
+  // Opens the SSE log stream. Called both after /api/start succeeds and on
+  // mount when /api/run-status says a run is in progress (so a page refresh
+  // mid-run reattaches instead of leaving the UI stuck in idle).
+  const attachLogStream = () => {
+    if (eventSourceRef.current) eventSourceRef.current.close();
+    const source = new EventSource('/api/logs');
+    eventSourceRef.current = source;
+    source.onmessage = (event) => {
+      try {
+        handleLogPayload(JSON.parse(event.data));
+      } catch (err) {
+        addLog(`Bad SSE payload: ${err.message}`, 'error');
+      }
+    };
+    source.onerror = () => {
+      source.close();
+      eventSourceRef.current = null;
+      addLog('Lost connection to stream.', 'error');
+      setIsRunning(false);
+    };
+  };
+
   useEffect(() => {
-    fetch('/api/db')
-      .then(res => res.json())
-      .then(data => {
+    // Subscribe to backend-online signal coming from apiFetch.
+    const unsub = backendStatus.subscribe(setBackendOnline);
+
+    const loadAll = async () => {
+      try {
+        const r = await apiFetch('/api/db');
+        const data = await r.json();
         if (data.stats) setStats(data.stats);
         if (data.history) setActivityDetails({ jobs: data.history.jobs || [], profilesPosts: data.history.profilesPosts || [] });
-      })
-      .catch(err => console.error('Failed to load db', err));
-
-    fetch('/api/models')
-      .then(res => res.json())
-      .then(data => {
+      } catch { /* backendStatus flipped */ }
+      try {
+        const r = await apiFetch('/api/models');
+        const data = await r.json();
         if (data.models && data.models.length > 0) setAvailableModels(data.models);
         if (data.warning) addLog(data.warning, 'warning');
-      })
-      .catch(err => console.error('Failed to load models', err));
+      } catch { /* */ }
+      try {
+        const r = await apiFetch('/api/login-status');
+        const data = await r.json();
+        setLoginStatus(data.logged_in);
+      } catch {
+        setLoginStatus(false);
+      }
 
-    checkLoginStatus();
+      // ── First-load recovery: replay live-log buffer and reattach SSE if a run
+      // is in progress. This is what makes a page refresh during a run NOT
+      // appear as "everything reset". Only run once per mount; the 4s retry
+      // loop above still works for /api/db reloads but skips recovery.
+      if (initialRecoveryDoneRef.current) return;
+      try {
+        const runRes = await apiFetch('/api/run-status');
+        const runData = await runRes.json();
+        const logsRes = await apiFetch('/api/recent-logs');
+        const logsData = await logsRes.json();
+        const replayLogs = Array.isArray(logsData.logs) ? logsData.logs : [];
+
+        initialRecoveryDoneRef.current = true;
+
+        if (replayLogs.length > 0) {
+          // Drop the "System initialized" placeholder and rebuild the log feed
+          // from the server-side ring buffer.
+          setLogs([]);
+          for (const payload of replayLogs) {
+            handleLogPayload(payload, { isReplay: true });
+          }
+        }
+        if (runData.is_running) {
+          setIsRunning(true);
+          setIsPaused(!!runData.is_paused);
+          attachLogStream();
+        }
+      } catch { /* recovery is best-effort */ }
+    };
+
+    loadAll();
+    // Retry the initial load every 4s while the backend is offline.
+    const interval = setInterval(() => {
+      if (!backendStatus.online) loadAll();
+    }, 4000);
+
+    return () => { clearInterval(interval); unsub(); };
   }, []);
 
   const handleClearDb = async () => {
@@ -1145,47 +2000,7 @@ export default function Root() {
         return;
       }
 
-      if (eventSourceRef.current) eventSourceRef.current.close();
-
-      const source = new EventSource('/api/logs');
-      eventSourceRef.current = source;
-
-      source.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        if (data.action === 'PAUSED') setIsPaused(true);
-        else if (data.action === 'RESUMED') setIsPaused(false);
-        else if (data.action === 'ASK_HUMAN' && data.question) setPendingQuestion(data.question);
-        else if (data.action === 'ANSWER_HUMAN') setPendingQuestion(prev => (prev && prev.id === data.question_id ? null : prev));
-        addLog(data.message, data.type || 'info', { action: data.action });
-        if (data.detail) {
-          setActivityDetails(prev => {
-            const bucket = data.detail.kind === 'Job' ? 'jobs' : 'profilesPosts';
-            return { ...prev, [bucket]: upsertDetail(prev[bucket], data.detail, data.action) };
-          });
-        }
-
-        if (data.action === 'SEARCHED_JOB' && data.detail) {
-          setStats(s => ({ ...s, jobsSearched: s.jobsSearched + 1 }));
-        } else if ((data.action === 'SEARCHED_PERSON' || data.action === 'SEARCHED_POST') && data.detail) {
-          setStats(s => ({ ...s, profilesFound: s.profilesFound + 1 }));
-        } else if (data.action === 'APPLIED') {
-          setStats(s => ({ ...s, applicationsSent: s.applicationsSent + 1 }));
-        } else if (data.action === 'DRAFTED_EMAIL' || data.action === 'DRAFTED_DM') {
-          setStats(s => ({ ...s, draftsCreated: s.draftsCreated + 1 }));
-        } else if (data.action === 'DONE') {
-          source.close();
-          eventSourceRef.current = null;
-          setIsRunning(false);
-        }
-      };
-
-      source.onerror = () => {
-        // Browser auto-reconnects on transient errors; close to make termination final.
-        source.close();
-        eventSourceRef.current = null;
-        addLog('Lost connection to stream.', 'error');
-        setIsRunning(false);
-      };
+      attachLogStream();
 
     } catch (err) {
       addLog(`Failed to start agent: ${err.message}`, 'error');
@@ -1195,6 +2010,16 @@ export default function Root() {
 
   return (
     <>
+      {!backendOnline && (
+        <div style={{
+          position: 'fixed', top: 0, left: 0, right: 0, zIndex: 9500,
+          background: '#7f1d1d', color: '#fff', padding: '8px 16px',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.3)', fontSize: '0.88rem',
+        }}>
+          <span>⚠ Backend offline at http://127.0.0.1:8000 — start it with <code style={{ background: 'rgba(0,0,0,0.3)', padding: '0 6px', borderRadius: '3px' }}>python server.py</code>. Retrying every 4s…</span>
+        </div>
+      )}
       {pendingQuestion && (
         <HumanQuestionModal
           question={pendingQuestion}

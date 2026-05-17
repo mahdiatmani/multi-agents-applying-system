@@ -11,6 +11,9 @@ google-credentials*.json
 CV.txt
 *.pdf
 
+# Generated cover letters (per-application PDFs)
+cover-letters/
+
 # Notes that aren't source code
 wheres.txt
 
@@ -19,11 +22,18 @@ wheres.txt
 state/*.json
 state/errors/
 state/logs/
-state/incidents/
-state/self_heal/
 state/backups/
 state/applications.json
 state/__pycache__/
+state/debug/
+state/incidents/
+state/self_heal/
+
+# ── Large media / local screenshots ─────────────────────────────────────────
+*.mp4
+*.mov
+*.avi
+localhost_*.png
 
 # ── Python ──────────────────────────────────────────────────────────────────
 __pycache__/

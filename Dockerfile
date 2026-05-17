@@ -22,10 +22,10 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright and its system dependencies + xvfb for headed mode support
+# Install Playwright and its system dependencies + VNC tools for UI visibility
 RUN playwright install --with-deps chromium \
     && apt-get update \
-    && apt-get install -y --no-install-recommends xvfb xauth \
+    && apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify fluxbox xauth \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the rest of the application
@@ -34,7 +34,10 @@ COPY . .
 # Copy the built React app from Stage 1
 COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
 
-# Expose the FastAPI port
-EXPOSE 8000
+# Make start script executable
+RUN chmod +x /app/start.sh
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+# Expose the FastAPI port and NoVNC port
+EXPOSE 8000 6080
+
+CMD ["/app/start.sh"]

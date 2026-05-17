@@ -12,7 +12,6 @@ Usage:
 import os
 import sys
 import json
-import time
 
 def main():
     # Load env
@@ -146,7 +145,7 @@ def main():
             print("  You can now start the bot — it will use this session.")
             print(f"{'=' * 60}")
         else:
-            print(f"\n[!] WARNING: No li_at cookie found. Login may not have fully completed.")
+            print("\n[!] WARNING: No li_at cookie found. Login may not have fully completed.")
             print("[!] The bot might not be able to authenticate. Try logging in again.")
     except Exception as e:
         print(f"[!] Could not verify cookies: {e}")

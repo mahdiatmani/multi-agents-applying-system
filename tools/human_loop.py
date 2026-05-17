@@ -9,7 +9,7 @@ onto the SSE feed as `{action: "ASK_HUMAN", ...}`. The frontend opens a modal in
 
 import threading
 import uuid
-from typing import Any, Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 _LOCK = threading.Lock()
 _QUESTIONS: dict[str, dict] = {}
@@ -41,7 +41,15 @@ def ask_user(
 ) -> Optional[str]:
     """Block the calling worker thread until the user answers (or times out / is cancelled).
 
-    Returns the user's answer string on success, None on timeout / cancel / empty submit."""
+    Returns the user's answer string on success, None on timeout / cancel / empty submit /
+    if a stop was requested (so cascading ask_user calls during shutdown unwind fast)."""
+    # Stop short-circuit: don't enqueue new questions during shutdown.
+    try:
+        from tools import run_control
+        if run_control.is_stopping():
+            return None
+    except Exception:
+        pass
     qid = uuid.uuid4().hex[:12]
     ev = threading.Event()
     entry = {

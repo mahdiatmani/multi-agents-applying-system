@@ -7,7 +7,7 @@ OVERRIDES_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "
 _lock = threading.Lock()
 
 FIELDS = (
-    "first_name", "last_name", "email", "phone", "city",
+    "first_name", "last_name", "email", "phone", "city", "country",
     "linkedin", "github", "portfolio", "years_exp",
     "authorized", "sponsorship", "relocate", "notice", "salary",
 )

@@ -184,6 +184,10 @@ Easy Apply, sends connection requests, or drafts personalized outreach emails/DM
       modal button labels via the new `_modal_button_texts` helper,
       (e) logs `page.url`, heading, dom-delta, messages, and buttons
       in the reason string.
+- [x] **Robust Submit Button Detection**: The `_button_in` locator has
+      been updated with fallback strategies (`has-text`, `aria-label`)
+      to ensure buttons nested in complex DOM structures (like spans
+      inside buttons) are reliably clicked, preventing false validation loops.
 - [x] **PERSON / watch-mode runaway loop**: `search_person_node`,
       `search_job_node`, and `search_post_node` now sleep with
       exponential backoff (15-25s / 25-40s / 40-60s) when results are
@@ -199,6 +203,14 @@ Easy Apply, sends connection requests, or drafts personalized outreach emails/DM
       'VERBOSE'}`. The flag is flipped on while `run_agent_workflow`
       runs whenever `StartRequest.verbose` is true; UI sidebar has a
       "Verbose logs (debug)" checkbox.
+- [x] **Sequential Multi-Role Execution**: When a user selects multiple
+      roles, they are now strictly processed sequentially (one finishes
+      completely before the next begins), avoiding concurrent browser
+      interference.
+- [x] **Vite IPv6 Proxy `ECONNREFUSED`**: Fixed the frontend development
+      server by explicitly targeting `127.0.0.1` rather than `localhost`
+      to prevent Node.js IPv6 resolution errors when communicating with
+      the IPv4 FastAPI backend.
 - [~] **External ATS applications** — *partial: lead capture only*:
       `_detect_external_apply` now returns `(is_external, signal,
       meta)` where `meta` carries `destination_url` +

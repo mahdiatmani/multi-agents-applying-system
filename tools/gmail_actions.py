@@ -3,7 +3,6 @@ import base64
 from email.message import EmailMessage
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -11,9 +10,12 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.compose"]
 
 def get_gmail_service():
     creds = None
-    # Paths are relative to the root of the project
-    token_path = os.path.join(os.path.dirname(__file__), "..", "token.json")
-    creds_path = os.path.join(os.path.dirname(__file__), "..", "credentials.json")
+    # Token now lives in state/ so it rides along with the mounted state volume
+    # in Docker. Legacy project-root location is still checked as a fallback.
+    project_root = os.path.join(os.path.dirname(__file__), "..")
+    state_token = os.path.join(project_root, "state", "token.json")
+    legacy_token = os.path.join(project_root, "token.json")
+    token_path = state_token if os.path.exists(state_token) else legacy_token
 
     if os.path.exists(token_path):
         creds = Credentials.from_authorized_user_file(token_path, SCOPES)
@@ -29,9 +31,11 @@ def get_gmail_service():
         else:
             print("WARNING: token.json not found or invalid. You must run setup_auth.py locally first!")
             return None
-            
-        # Save the credentials for the next run
-        with open(token_path, "w") as token:
+
+        # Save the credentials for the next run — always to the state/ path so
+        # refreshed tokens survive container restarts.
+        os.makedirs(os.path.dirname(state_token), exist_ok=True)
+        with open(state_token, "w") as token:
             token.write(creds.to_json())
 
     try:
@@ -41,12 +45,16 @@ def get_gmail_service():
         print(f"An error occurred: {error}")
         return None
 
-def create_gmail_draft(to_email: str, subject: str, body_text: str) -> bool:
+def create_gmail_draft(to_email: str, subject: str, body_text: str) -> tuple[bool, str]:
+    """Returns (success, failure_reason). failure_reason is one of:
+       '' (success), 'unauthenticated' (no/expired token.json),
+       'http_error: <details>', 'unknown: <details>'."""
     service = get_gmail_service()
     if not service:
-        print("Failed to obtain Gmail service.")
-        return False
-        
+        msg = "Gmail not authenticated (token.json missing or invalid). Run setup_auth.py."
+        print(f"[Gmail] {msg}", flush=True)
+        return False, "unauthenticated"
+
     try:
         message = EmailMessage()
         message.set_content(body_text)
@@ -54,14 +62,15 @@ def create_gmail_draft(to_email: str, subject: str, body_text: str) -> bool:
         message["From"] = "me"
         message["Subject"] = subject
 
-        # Encode the message
         encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
         create_message = {"message": {"raw": encoded_message}}
-        
-        # Create draft via API
+
         draft = service.users().drafts().create(userId="me", body=create_message).execute()
-        print(f"Draft created successfully! Draft ID: {draft['id']}")
-        return True
+        print(f"[Gmail] Draft created. ID: {draft['id']}", flush=True)
+        return True, ""
     except HttpError as error:
-        print(f"An error occurred creating draft: {error}")
-        return False
+        print(f"[Gmail] HTTP error creating draft: {error}", flush=True)
+        return False, f"http_error: {error}"
+    except Exception as exc:
+        print(f"[Gmail] Unknown error creating draft: {exc}", flush=True)
+        return False, f"unknown: {type(exc).__name__}: {exc}"

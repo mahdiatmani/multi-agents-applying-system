@@ -5,6 +5,7 @@ import asyncio
 import tempfile
 import threading
 import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request, UploadFile, File, Form
@@ -22,6 +23,9 @@ from agent.graph import build_graph, check_pending_connections
 from agent.browser import BrowserManager, has_valid_session, do_manual_login
 from tools import pending as pending_db
 from tools import applications as applications_db
+from tools import external_leads
+from tools import outreach
+from tools import apply_link
 from tools import qa_overrides
 from tools import run_control
 from tools import human_loop
@@ -44,39 +48,41 @@ ROOT_DIR = Path(__file__).resolve().parent
 FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"
 ALLOWED_ORIGINS = [o for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 
-app = FastAPI()
-
-
-@app.on_event("startup")
-async def _setup_human_loop_notifier():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Setup notifiers
     loop = asyncio.get_running_loop()
 
     def notifier(payload: dict) -> None:
         try:
-            asyncio.run_coroutine_threadsafe(log_queue.put(payload), loop)
+            asyncio.run_coroutine_threadsafe(log_queue.put(_stash(payload)), loop)
         except Exception:
             pass
 
     human_loop.set_notifier(notifier)
 
-
-@app.on_event("startup")
-async def _start_pending_sweeper():
+    # Pending-connection sweeper: every 15 min, refresh statuses and send any
+    # DMs that have ripened (default 10 min since acceptance — tunable via
+    # DM_RIPENING_SECONDS in graph.py).
+    sweep_interval = int(os.getenv("PENDING_SWEEP_SECONDS", "900"))  # 15 min
     async def _loop():
-        # Wait 5 minutes after startup before the first sweep.
-        await asyncio.sleep(300)
+        await asyncio.sleep(60)  # let the app settle before the first sweep
         while True:
             try:
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, lambda: check_pending_connections(headless=True))
-                print("[pending-sweeper] daily sweep done", flush=True)
+                result = await loop.run_in_executor(None, lambda: check_pending_connections(headless=True))
+                print(f"[pending-sweeper] sweep done: {result}", flush=True)
             except Exception as exc:
                 print(f"[pending-sweeper] error: {exc}", flush=True)
-            # Sleep 24h between sweeps.
-            await asyncio.sleep(24 * 60 * 60)
-    task = asyncio.create_task(_loop())
-    _running_tasks.add(task)
-    task.add_done_callback(_running_tasks.discard)
+            await asyncio.sleep(sweep_interval)
+
+    sweeper_task = asyncio.create_task(_loop())
+    
+    yield
+    
+    sweeper_task.cancel()
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -90,9 +96,27 @@ if (FRONTEND_DIST / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
 
 log_queue: asyncio.Queue = asyncio.Queue()
+# Recent-log ring buffer — survives across SSE reconnects so a page refresh
+# can replay the live log feed instead of losing it. deque.append is atomic
+# in CPython, so it's safe to populate from worker threads too.
+from collections import deque  # noqa: E402
+LOG_BUFFER: deque = deque(maxlen=200)
+
+
+def _stash(payload: dict) -> dict:
+    """Append the payload to the recent-log buffer and return it unchanged.
+    Lets callers chain: `await log_queue.put(_stash(p))`."""
+    try:
+        LOG_BUFFER.append(payload)
+    except Exception:
+        pass
+    return payload
+
+
 active_tasks = 0
 active_tasks_lock = asyncio.Lock()
 _running_tasks: set[asyncio.Task] = set()
+
 
 _VERBOSE_PREFIXES = (
     "[Resolve]", "[2ndPass]", "[Audit]", "[Dump]", "[form_llm]",
@@ -117,11 +141,6 @@ class _StdoutTap:
             self._original.write(text)
         except Exception:
             pass
-        if not _verbose_state["on"]:
-            return
-        loop = _verbose_state["loop"]
-        if loop is None:
-            return
         with self._buf_lock:
             self._buffer += text
             lines = self._buffer.split("\n")
@@ -130,11 +149,16 @@ class _StdoutTap:
             stripped = line.strip()
             if not stripped:
                 continue
+            if not _verbose_state["on"]:
+                continue
+            loop = _verbose_state["loop"]
+            if loop is None:
+                continue
             if not any(stripped.startswith(p) for p in _VERBOSE_PREFIXES):
                 continue
             payload = {"message": stripped, "type": "debug", "action": "VERBOSE"}
             try:
-                asyncio.run_coroutine_threadsafe(log_queue.put(payload), loop)
+                asyncio.run_coroutine_threadsafe(log_queue.put(_stash(payload)), loop)
             except Exception:
                 pass
 
@@ -214,13 +238,22 @@ def detail_from_node(search_type: str, action: str, value: dict) -> dict | None:
         details = value.get("post_details") or {}
         if not details:
             return None
+        # Prefer the actual post permalink (extracted by the JS scraper from the
+        # post's "feed/update/urn:li:activity:..." anchor) over the navigation URL
+        # so "Open on LinkedIn" deep-links to the post, not the home feed.
+        permalink = details.get("post_url") or details.get("source_url") or value.get("current_url", "")
         return {
             "kind": "Post",
             "search_type": search_type,
             "identifier": details.get("identifier") or details.get("content"),
             "title": details.get("author") or "LinkedIn post",
-            "url": details.get("source_url") or value.get("current_url", ""),
+            "url": permalink,
             "summary": preview_text(details.get("content")),
+            "author_url": details.get("author_url", ""),
+            "primary_email": details.get("primary_email", ""),
+            "emails": details.get("emails") or [],
+            "attached_job_url": details.get("attached_job_url", ""),
+            "post_url": details.get("post_url", ""),
         }
 
     return None
@@ -243,7 +276,8 @@ def _persist_detail(detail: dict, evaluated: bool = False) -> None:
         print(f"[persist] wrote {kind} id={item['id']}", flush=True)
     except Exception as exc:
         print(f"[persist] FAILED ({type(exc).__name__}): {exc}", flush=True)
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
 
 
 def _record_action(action: str) -> None:
@@ -258,28 +292,30 @@ def _record_action(action: str) -> None:
             update_stat("externalLeads")
         elif action in ("DRAFTED_EMAIL", "DRAFTED_DM"):
             update_stat("draftsCreated")
+        elif action == "EXTERNAL_LINK_RECORDED":
+            update_stat("draftsCreated")  # surfaces in dashboard "Drafts" tile too
         print(f"[record_action] action={action} applied", flush=True)
     except Exception as exc:
         print(f"[record_action] FAILED ({type(exc).__name__}): {exc}", flush=True)
 
 
 async def run_agent_workflow(config: StartRequest, search_type: str):
-    model_infos = await asyncio.to_thread(fetch_ollama_models, get_ollama_base_url())
+    await asyncio.to_thread(fetch_ollama_models, get_ollama_base_url())
     resolved_model = resolve_model(config.llm_model)
-    await log_queue.put({
+    await log_queue.put(_stash({
         "message": (
             f"[{search_type}] Initializing workflow - Role: {config.role}, "
             f"Locations: {config.locations} using {resolved_model} (Headless: {config.headless})"
         ),
         "type": "system",
-    })
+    }))
 
     try:
         if config.verbose:
             with _verbose_lock:
                 _verbose_state["loop"] = asyncio.get_running_loop()
                 _verbose_state["on"] = True
-            await log_queue.put({"message": "Verbose logs enabled — debug prefixes will stream here.", "type": "system"})
+            await log_queue.put(_stash({"message": "Verbose logs enabled — debug prefixes will stream here.", "type": "system"}))
         graph_app = build_graph()
 
         initial_state = {
@@ -306,7 +342,7 @@ async def run_agent_workflow(config: StartRequest, search_type: str):
             "verbose": config.verbose,
         }
 
-        await log_queue.put({"message": f"[{search_type}] Browser initializing...", "type": "info"})
+        await log_queue.put(_stash({"message": f"[{search_type}] Browser initializing...", "type": "info"}))
 
         loop = asyncio.get_running_loop()
 
@@ -322,6 +358,15 @@ async def run_agent_workflow(config: StartRequest, search_type: str):
                             msg += f" | Errors: {value.get('errors')}"
 
                         log_payload = {"message": msg, "type": "info", "action": action}
+
+                        # Post mode runs in batches: surface queue depth + the role this
+                        # batch was scraped for so the Live View can show "N posts remaining".
+                        if "posts_queue" in value:
+                            log_payload["post_batch"] = {
+                                "queue_depth": len(value.get("posts_queue") or []),
+                                "batch_role": value.get("posts_batch_role", ""),
+                            }
+
                         search_detail = detail_from_node(search_type, action, value)
                         if search_detail:
                             last_search_detail = search_detail
@@ -340,10 +385,12 @@ async def run_agent_workflow(config: StartRequest, search_type: str):
                                 {"id": evaluated_detail.get("identifier") or evaluated_detail.get("url"), **evaluated_detail},
                             )
 
-                        if action in ("APPLIED", "APPLY_FAILED", "DRAFTED_EMAIL", "DRAFTED_DM", "EXTERNAL_LEAD"):
+                        if action in ("APPLIED", "APPLY_FAILED", "DRAFTED_EMAIL", "DRAFTED_DM", "EXTERNAL_LEAD", "EXTERNAL_LINK_RECORDED"):
                             _record_action(action)
 
-                        asyncio.run_coroutine_threadsafe(log_queue.put(log_payload), loop=loop)
+                        asyncio.run_coroutine_threadsafe(log_queue.put(_stash(log_payload)), loop=loop)
+            except run_control.StopRequested:
+                raise
             finally:
                 try:
                     BrowserManager().close()
@@ -354,20 +401,20 @@ async def run_agent_workflow(config: StartRequest, search_type: str):
             await loop.run_in_executor(None, execute_graph)
         except run_control.StopRequested as stop_exc:
             print(f"[{search_type}] Stop honored: {stop_exc}", flush=True)
-            await log_queue.put({
+            await log_queue.put(_stash({
                 "message": f"[{search_type}] Stopped by user.",
                 "type": "system",
                 "action": "STOPPED",
-            })
+            }))
 
     except Exception as e:
         tb = traceback.format_exc()
         print(f"[{search_type}] Fatal error traceback:\n{tb}")
-        await log_queue.put({
+        await log_queue.put(_stash({
             "message": f"[{search_type}] Fatal error: {str(e)}\n{tb}",
             "type": "error",
             "action": "ERROR",
-        })
+        }))
     finally:
         global active_tasks
         async with active_tasks_lock:
@@ -376,11 +423,11 @@ async def run_agent_workflow(config: StartRequest, search_type: str):
                 active_tasks = 0
                 with _verbose_lock:
                     _verbose_state["on"] = False
-                await log_queue.put({
+                await log_queue.put(_stash({
                     "message": "All workflows execution completed.",
                     "type": "success",
                     "action": "DONE",
-                })
+                }))
 
 
 @app.get("/")
@@ -404,6 +451,17 @@ async def _drain_log_queue() -> None:
             log_queue.get_nowait()
         except asyncio.QueueEmpty:
             break
+    # Also clear the recent-log replay buffer so a new run doesn't show stale
+    # entries from the previous run on a fresh page load.
+    try:
+        LOG_BUFFER.clear()
+    except Exception:
+        pass
+
+
+async def run_workflows_sequentially(config: StartRequest, search_types: list[str]):
+    for search_type in search_types:
+        await run_agent_workflow(config, search_type)
 
 
 @app.post("/api/start")
@@ -423,10 +481,9 @@ async def start_agent(req: StartRequest):
         human_loop.cancel_all()  # release any leftover question waiters
         active_tasks = len(req.search_types)
 
-    for search_type in req.search_types:
-        task = asyncio.create_task(run_agent_workflow(req, search_type))
-        _running_tasks.add(task)
-        task.add_done_callback(_running_tasks.discard)
+    task = asyncio.create_task(run_workflows_sequentially(req, req.search_types))
+    _running_tasks.add(task)
+    task.add_done_callback(_running_tasks.discard)
 
     return {"status": "started"}
 
@@ -447,7 +504,44 @@ async def api_reset_db():
     reset_history()
     pending_db.reset()
     applications_db.reset()
-    return {"status": "success", "message": "DB, history, pending connections, and application counter cleared."}
+    external_leads.reset()
+    return {"status": "success", "message": "DB, history, pending connections, application counter, and external leads cleared."}
+
+
+# ─── External-leads endpoints ───────────────────────────────────────────────
+
+@app.get("/api/external-leads")
+async def api_external_leads():
+    return {"stats": external_leads.stats(), "items": external_leads.list_items()}
+
+
+class LeadStatusRequest(BaseModel):
+    identifier: str
+    status: str
+
+
+@app.post("/api/external-leads/status")
+async def api_external_leads_status(req: LeadStatusRequest):
+    ok = external_leads.set_status(req.identifier, req.status)
+    if not ok:
+        return JSONResponse({"error": "not_found_or_invalid_status"}, status_code=400)
+    return {"status": "ok"}
+
+
+class LeadIdentifier(BaseModel):
+    identifier: str
+
+
+@app.post("/api/external-leads/remove")
+async def api_external_leads_remove(req: LeadIdentifier):
+    ok = external_leads.remove(req.identifier)
+    return {"status": "ok" if ok else "not_found"}
+
+
+@app.post("/api/external-leads/clear")
+async def api_external_leads_clear():
+    external_leads.reset()
+    return {"status": "ok"}
 
 
 @app.get("/api/qa-overrides")
@@ -478,12 +572,109 @@ async def api_pending():
     }
 
 
+# ─── Outreach endpoints (emails + DMs + connection requests, unified view) ──
+
+def _gmail_authed() -> bool:
+    """True if token.json exists and looks like a refreshable credential file.
+    Cheap check — does NOT verify the token is actually valid with Google."""
+    token_path = ROOT_DIR / "token.json"
+    if not token_path.exists():
+        return False
+    try:
+        import json as _json
+        with open(token_path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        return bool(data.get("refresh_token") or data.get("token"))
+    except Exception:
+        return False
+
+
+@app.get("/api/outreach")
+async def api_outreach():
+    """Unified outreach view: emails drafted + apply-via-link posts + connection
+    requests + queued/sent DMs, with one summary stat block. `gmail_authed`
+    flag drives the 'Set up Gmail auth' banner on the Outreach tab."""
+    return {
+        "gmail_authed": _gmail_authed(),
+        "emails": {
+            "items": outreach.list_items(),
+            "stats": outreach.stats(),
+        },
+        "links": {
+            "items": apply_link.list_items(),
+            "stats": apply_link.stats(),
+        },
+        "connections": {
+            "items": pending_db.list_items(),
+            "stats": pending_db.stats(),
+        },
+    }
+
+
+class ApplyLinkStatusRequest(BaseModel):
+    identifier: str  # apply_url or post_url
+    status: str      # new | opened | applied | dismissed
+
+
+@app.post("/api/outreach/links/status")
+async def api_outreach_link_status(req: ApplyLinkStatusRequest):
+    ok = apply_link.set_status(req.identifier, req.status)
+    if not ok:
+        return JSONResponse({"error": "not_found_or_invalid_status"}, status_code=400)
+    return {"status": "ok"}
+
+
+class ApplyLinkIdentifier(BaseModel):
+    identifier: str
+
+
+@app.post("/api/outreach/links/remove")
+async def api_outreach_link_remove(req: ApplyLinkIdentifier):
+    ok = apply_link.remove(req.identifier)
+    return {"status": "ok" if ok else "not_found"}
+
+
+@app.post("/api/outreach/links/clear")
+async def api_outreach_links_clear():
+    apply_link.reset()
+    return {"status": "ok"}
+
+
+class OutreachEmailStatusRequest(BaseModel):
+    identifier: str  # to_email or post_url
+    status: str      # drafted | sent | replied | ignored
+
+
+@app.post("/api/outreach/emails/status")
+async def api_outreach_email_status(req: OutreachEmailStatusRequest):
+    ok = outreach.set_status(req.identifier, req.status)
+    if not ok:
+        return JSONResponse({"error": "not_found_or_invalid_status"}, status_code=400)
+    return {"status": "ok"}
+
+
+class OutreachEmailIdentifier(BaseModel):
+    identifier: str
+
+
+@app.post("/api/outreach/emails/remove")
+async def api_outreach_email_remove(req: OutreachEmailIdentifier):
+    ok = outreach.remove(req.identifier)
+    return {"status": "ok" if ok else "not_found"}
+
+
+@app.post("/api/outreach/emails/clear")
+async def api_outreach_emails_clear():
+    outreach.reset()
+    return {"status": "ok"}
+
+
 @app.post("/api/pause")
 async def api_pause():
     if run_control.is_paused():
         return {"status": "already_paused", "paused": True}
     run_control.pause()
-    await log_queue.put({"message": "Agent paused — running nodes will block until resumed.", "type": "system", "action": "PAUSED"})
+    await log_queue.put(_stash({"message": "Agent paused — running nodes will block until resumed.", "type": "system", "action": "PAUSED"}))
     return {"status": "paused", "paused": True}
 
 
@@ -492,7 +683,7 @@ async def api_resume():
     if not run_control.is_paused():
         return {"status": "already_running", "paused": False}
     run_control.resume()
-    await log_queue.put({"message": "Agent resumed.", "type": "system", "action": "RESUMED"})
+    await log_queue.put(_stash({"message": "Agent resumed.", "type": "system", "action": "RESUMED"}))
     return {"status": "resumed", "paused": False}
 
 
@@ -501,19 +692,40 @@ async def api_pause_status():
     return {"paused": run_control.is_paused()}
 
 
+@app.get("/api/run-status")
+async def api_run_status():
+    """Snapshot of whether an agent run is currently active. Used by the frontend
+    on mount so a page refresh during a run can restore the Run/Stop button
+    state and re-open the SSE log stream — without this, refresh shows idle
+    even though the bot is still working."""
+    return {
+        "is_running": active_tasks > 0,
+        "is_paused": run_control.is_paused(),
+        "active_tasks": active_tasks,
+    }
+
+
+@app.get("/api/recent-logs")
+async def api_recent_logs():
+    """Return the recent-log ring buffer (up to 200 most recent log payloads)
+    in chronological order. Frontend loads this on mount to replay the live
+    log feed across page refreshes."""
+    return {"logs": list(LOG_BUFFER)}
+
+
 @app.post("/api/stop")
 async def api_stop():
     if not run_control.is_stopping():
         run_control.request_stop()
         cancelled = human_loop.cancel_all()
-        await log_queue.put({
+        await log_queue.put(_stash({
             "message": (
-                f"Stop requested — agent will halt at the next node boundary."
+                "Stop requested — agent will halt at the next node boundary."
                 + (f" Cancelled {cancelled} pending human question(s)." if cancelled else "")
             ),
             "type": "system",
             "action": "STOPPING",
-        })
+        }))
     return {"status": "stopping"}
 
 
@@ -604,6 +816,7 @@ class ParsedApplicantProfile(BaseModel):
     email: str = Field(default="", description="Primary email address.")
     phone: str = Field(default="", description="Phone in international format if possible, e.g. +212...")
     city: str = Field(default="", description="Current city (no country).")
+    country: str = Field(default="", description="Country of residence (e.g. 'Morocco', 'France'). If the CV says 'Rabat, Morocco', country is 'Morocco'.")
     linkedin: str = Field(default="", description="Full LinkedIn profile URL.")
     github: str = Field(default="", description="Full GitHub profile URL.")
     portfolio: str = Field(default="", description="Personal site / portfolio URL.")
@@ -687,6 +900,7 @@ _PROFILE_ENV_KEYS = {
     "email": "APPLICANT_EMAIL",
     "phone": "APPLICANT_PHONE",
     "city": "APPLICANT_CITY",
+    "country": "APPLICANT_COUNTRY",
     "linkedin": "APPLICANT_LINKEDIN",
     "github": "APPLICANT_GITHUB",
     "portfolio": "APPLICANT_PORTFOLIO",
