@@ -1423,6 +1423,91 @@ def _has_existing_messages(page: Page) -> bool:
     return False
 
 
+# Aria-label fragments for the X (close) button on the messaging-overlay bubble
+# header. LinkedIn localizes the full label ("Close your conversation with
+# Samia JANBAR"), so we match by substring on the leading verb. Covers EN/FR/
+# ES/IT/PT/DE — the same locales the rest of the bot already supports.
+_MSG_OVERLAY_CLOSE_LABEL_FRAGMENTS = (
+    "close your conversation", "close conversation", "close",
+    "fermer", "fermer la conversation",
+    "cerrar", "cerrar conversación", "cerrar la conversación",
+    "chiudi", "chiudi la conversazione",
+    "fechar", "fechar conversa",
+    "schließen", "konversation schließen",
+)
+
+# Stable structural selectors that LinkedIn has shipped across rollouts.
+# Most reliable first; fallbacks last. Used in addition to the aria-label
+# scan below.
+_MSG_OVERLAY_CLOSE_SELECTORS = (
+    "button[data-test-icon='close-small']",
+    ".msg-overlay-bubble-header__control[data-test-icon='close-small']",
+    ".msg-overlay-bubble-header__controls button[aria-label*='Close' i]",
+    ".msg-overlay-bubble-header__controls button:has(svg[data-test-icon='close-small'])",
+    ".msg-overlay-conversation-bubble-header button[aria-label*='Close' i]",
+)
+
+
+def _close_message_overlay(page: Page) -> bool:
+    """Best-effort: click the X on the messaging-overlay bubble so it doesn't
+    linger on the profile after a DM is sent.
+
+    LinkedIn keeps the conversation panel open after Send so the user can keep
+    chatting; for the bot that's just visual noise sitting on top of the next
+    profile. Try several stable selectors, then fall back to a multi-locale
+    aria-label scan. Returns True if a click landed, False otherwise — non-fatal
+    either way."""
+    # Structural-selector pass.
+    for sel in _MSG_OVERLAY_CLOSE_SELECTORS:
+        try:
+            btn = page.locator(sel).first
+            if _visible(btn):
+                try:
+                    btn.click(timeout=1500)
+                except Exception:
+                    try:
+                        btn.click(timeout=1500, force=True)
+                    except Exception:
+                        continue
+                page.wait_for_timeout(400)
+                return True
+        except Exception:
+            continue
+
+    # Aria-label substring pass (multi-locale). Walk every button in the
+    # overlay header region and pick the one whose aria-label starts with
+    # a known "close" verb.
+    try:
+        buttons = page.locator(
+            ".msg-overlay-bubble-header__controls button, "
+            ".msg-overlay-conversation-bubble-header button"
+        )
+        count = min(buttons.count(), 10)
+    except Exception:
+        count = 0
+    for i in range(count):
+        try:
+            b = buttons.nth(i)
+            if not _visible(b):
+                continue
+            label = (b.get_attribute("aria-label") or "").strip().lower()
+            if not label:
+                continue
+            if any(frag in label for frag in _MSG_OVERLAY_CLOSE_LABEL_FRAGMENTS):
+                try:
+                    b.click(timeout=1500)
+                except Exception:
+                    try:
+                        b.click(timeout=1500, force=True)
+                    except Exception:
+                        continue
+                page.wait_for_timeout(400)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def send_dm_to_profile(page: Page, profile_url: str, message: str) -> tuple[bool, str]:
     """Open the Message composer on a profile and send a message.
 
@@ -1449,6 +1534,9 @@ def send_dm_to_profile(page: Page, profile_url: str, message: str) -> tuple[bool
         # a non-failure so we don't keep retrying.
         if _has_existing_messages(page):
             print(f"[DM] {profile_url} already has a conversation — skipping.", flush=True)
+            # Still close the panel so the bot doesn't carry the overlay
+            # into the next profile.
+            _close_message_overlay(page)
             return False, "already_messaged"
 
         editor = page.locator("div.msg-form__contenteditable[contenteditable='true']").first
@@ -1465,12 +1553,14 @@ def send_dm_to_profile(page: Page, profile_url: str, message: str) -> tuple[bool
                 if _visible(btn):
                     btn.click()
                     random_sleep(2, 3)
+                    _close_message_overlay(page)
                     return True, ""
             except Exception:
                 continue
         # Fallback: any visible Send button on page.
         if _click_first_visible_button(page, _SEND_LABELS):
             random_sleep(2, 3)
+            _close_message_overlay(page)
             return True, ""
         return False, "no_send_button"
     except Exception as e:
