@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Any, Literal
 
 from state import AgentState
@@ -748,6 +749,35 @@ def _call_with_retry(chain, payload: dict, retries: int = 3):
     return None, last_exc
 
 
+_HIRING_BOOL_RE = re.compile(r"is[_\s]hiring\s*[:=]\s*\"?(true|false|yes|no)\b", re.IGNORECASE)
+_HIRING_REASON_RE = re.compile(r"reasoning\s*[:=]\s*\"?(.+?)\"?\s*(?:\n\s*\n|\Z)", re.IGNORECASE | re.DOTALL)
+
+
+def _hiring_from_raw_text(llm, content: str) -> HiringCheck | None:
+    """Fallback for when with_structured_output fails to parse the model's reply.
+
+    Why: Ollama models intermittently return plain text like
+    ``is_hiring: false\nReasoning: ...`` instead of strict JSON, which trips
+    LangChain's json_schema parser. The verdict is right there in the text, so
+    we extract it with a regex rather than dropping the result.
+    """
+    try:
+        raw = llm.invoke([
+            ("system", _HIRING_SYSTEM),
+            ("human", _HIRING_HUMAN.format(content=content)),
+        ])
+    except Exception:
+        return None
+    text = getattr(raw, "content", None) or str(raw) or ""
+    m = _HIRING_BOOL_RE.search(text)
+    if not m:
+        return None
+    is_hiring = m.group(1).lower() in {"true", "yes"}
+    reason_match = _HIRING_REASON_RE.search(text)
+    reasoning = reason_match.group(1).strip() if reason_match else text.strip()[:300]
+    return HiringCheck(is_hiring=is_hiring, reasoning=reasoning)
+
+
 def _eval_post(state: AgentState, content: str, model_name: str) -> dict:
     """Two LLM calls: classify hiring vs not, then (if hiring) match + contact mode."""
     llm = _get_llm(model_name)
@@ -765,15 +795,17 @@ def _eval_post(state: AgentState, content: str, model_name: str) -> dict:
     )
     hiring, exc = _call_with_retry(hiring_chain, {"content": content})
     if exc is not None or hiring is None:
-        return {
-            "match_score": 0,
-            "reasoning": f"Hiring-classifier LLM failed: {exc}",
-            "action_taken": "SKIP",
-            "extracted_email": "",
-            "apply_url": "",
-            "draft_message": "",
-            "errors": state.get("errors", []) + [f"hiring-llm: {exc}"],
-        }
+        hiring = _hiring_from_raw_text(llm, content)
+        if hiring is None:
+            return {
+                "match_score": 0,
+                "reasoning": f"Hiring-classifier LLM failed: {exc}",
+                "action_taken": "SKIP",
+                "extracted_email": "",
+                "apply_url": "",
+                "draft_message": "",
+                "errors": state.get("errors", []) + [f"hiring-llm: {exc}"],
+            }
     if not hiring.is_hiring:
         return {
             "match_score": 0,
