@@ -121,6 +121,54 @@ Easy Apply, sends connection requests, or drafts personalized outreach emails/DM
 - **Pending stats endpoint** (`GET /api/pending`): returns counts +
   full list of queued connections (status, queued DM, post content).
 
+### Job-fit pre-screener (`tools/job_screener.py`)
+- Reads each search-result card's visible text (title + company + location +
+  snippet) **before** opening the job and scores it 0-100 vs the CV with the
+  Ollama LLM. Cards below `JOB_FIT_SCREEN_THRESHOLD` (default 40) are marked
+  processed and skipped — saving a click, a `get_job_details` call, an
+  evaluate LLM call, and a likely-failing Easy Apply attempt.
+- Soft-fail: `score=-1` (LLM error / no resume / disabled) falls through to
+  normal processing instead of blocking. Toggle with `JOB_SCREENER_ENABLED=false`.
+
+### Pre-submit reviewer (`tools/pre_submit_reviewer.py`)
+- Runs immediately before clicking Next/Review/Submit on every Easy Apply step.
+  Sends every filled (label, value, kind) to the LLM with the resume + job
+  context and gets back a per-field verdict.
+- Flags: object-repr leaks (`AIMessage(`, `content=...`), hallucinated
+  skills/tools/certifications/languages not in the resume, language mismatch
+  (English answer to a French question), logical lies ("Yes, I worked at X"
+  when X isn't on the resume), empty-but-required fields.
+- Flagged fields are cleared so the next autofill pass re-resolves them with
+  fresh context. Toggle with `PRE_SUBMIT_REVIEWER_ENABLED=false`.
+
+### Cover-letter generation (`tools/cover_letter.py`)
+- When an Easy Apply form has a **separate** file-upload slot for a motivation /
+  cover letter (distinct from the resume slot), the bot generates a tailored
+  PDF instead of re-uploading the resume.
+- LLM prompt enforces: resume facts only (no invented skills/certs/languages),
+  job-language matched (writes in French for a French JD), 250–380 words,
+  plain text (no markdown / placeholders).
+- Optional self-critic pass behind `COVER_LETTER_CRITIC_ENABLED=true` (default
+  on) re-reads the draft and rewrites flagged issues before rendering.
+- Output saved to `cover-letters/<company>-<title>-<timestamp>.pdf` (gitignored)
+  for the user's records, then uploaded via Playwright.
+
+### Lead persistence (manual-apply queues)
+- **External leads** (`tools/external_leads.py`, `state/external_leads.json`):
+  every `external_apply` detection (modal didn't open, Workday / Lever /
+  Greenhouse / Ashby redirect) is recorded with title, company, destination
+  URL, and reason. Endpoints: `GET /api/external-leads`,
+  `POST /api/external-leads/status|remove|clear`. Status lifecycle:
+  `new → viewed → applied | dismissed`.
+- **Apply-link posts** (`tools/apply_link.py`,
+  `state/apply_link_posts.json`): hiring posts containing "apply at <url>" /
+  external ATS links that the bot deliberately doesn't auto-click. Endpoints:
+  `GET /api/outreach` (combined), `POST /api/outreach/links/status|remove|clear`.
+- **Outreach emails** (`tools/outreach.py`, `state/outreach_emails.json`):
+  every email draft the bot prepared, including failures (`gmail_unauth`,
+  `gmail_failed`) — so the user can copy/send manually when Gmail OAuth is
+  broken. Endpoints: `POST /api/outreach/emails/status|remove|clear`.
+
 ### Custom Easy Apply form filler (hybrid stack)
 - Layered answer resolution in `tools/apply_actions.py:_resolve_answer`:
   1. **Heuristics** (`_answer_for`) — hardcoded keyword patterns (phone,
@@ -211,16 +259,18 @@ Easy Apply, sends connection requests, or drafts personalized outreach emails/DM
       server by explicitly targeting `127.0.0.1` rather than `localhost`
       to prevent Node.js IPv6 resolution errors when communicating with
       the IPv4 FastAPI backend.
-- [~] **External ATS applications** — *partial: lead capture only*:
-      `_detect_external_apply` now returns `(is_external, signal,
-      meta)` where `meta` carries `destination_url` +
-      `destination_title`. `apply_node` recognises the
-      `external_apply` reason prefix and emits action `EXTERNAL_LEAD`
-      (counted in `update_stat('externalLeads')`) instead of
-      `APPLY_FAILED`, with the destination URL in the error message
-      and a screenshot still saved. Generic Workday / Lever /
-      Greenhouse / Ashby form filling is still out of scope —
-      remaining work is to actually fill those ATS forms.
+- [~] **External ATS applications** — *partial: lead capture + persisted
+      queue done, ATS form filling still TODO*:
+      `_detect_external_apply` returns `(is_external, signal, meta)` where
+      `meta` carries `destination_url` + `destination_title`. `apply_node`
+      recognises the `external_apply` reason prefix and emits action
+      `EXTERNAL_LEAD` (counted in `update_stat('externalLeads')`) instead of
+      `APPLY_FAILED`, with the destination URL in the error message and a
+      screenshot saved. Each lead is also persisted to
+      `state/external_leads.json` via `tools/external_leads.py` with status
+      lifecycle `new → viewed → applied | dismissed`, surfaced via
+      `/api/external-leads` and a dashboard tab. Generic Workday / Lever /
+      Greenhouse / Ashby form filling is still out of scope.
 - [x] **Custom Easy Apply questions — edge cases**: `_autofill_step`
       now also runs `_fill_contenteditables`,  `_fill_comboboxes`,
       and `_fill_checkbox_groups`. Contenteditable nodes are filled
@@ -269,16 +319,22 @@ Easy Apply, sends connection requests, or drafts personalized outreach emails/DM
 - [ ] **Retry queue for DM failures**: `dm_failed` entries in
       `pending_connections.json` never get retried. Add a retry loop
       with backoff, capped at N attempts.
-- [ ] **Surface emails-found / language-detected fields** in the post
-      activity card so the user can sanity-check the LLM's decision.
+- [~] **Surface emails-found / language-detected fields** — *partial*:
+      every email draft is now persisted to `state/outreach_emails.json`
+      (recipient, subject, body, post excerpt, match score, status) and
+      shown in the dashboard's Outreach tab via `/api/outreach`. The post
+      activity card itself still doesn't inline the detected email /
+      language — would be a quick win.
 - [ ] **Dynamic templating for PERSON mode**: `network_node` still uses
       the hardcoded `"Hi [Name], I noticed your work at [Company]..."`
       string. Reuse the LLM-generated `draft_message` like the POST flow.
-- [ ] **Cover-letter generation**: when an Easy Apply form requests
-      a cover letter (text area), the LLM filler now writes a short
-      response, but it's not job-aware (it only sees the question label,
-      not the JD). Pass `job_details.description` to `form_llm` so the
-      cover letter references the specific role.
+- [x] **Cover-letter generation**: separate file-upload slots for a
+      motivation letter are now handled by `tools/cover_letter.py` —
+      generates a job-aware PDF via the LLM (resume + JD), with an
+      optional self-critic rewrite pass (`COVER_LETTER_CRITIC_ENABLED`),
+      saved to `cover-letters/` and uploaded via Playwright. *Remaining:
+      job-aware free-text cover-letter answers in the form filler itself
+      (the `form_llm` path) — see next item.*
 - [ ] **Form-LLM job context**: same root issue as above —
       `llm_answer_for_field` only gets the CV + question label. When
       the question is open-ended ("Why are you interested in this
@@ -299,6 +355,15 @@ Easy Apply, sends connection requests, or drafts personalized outreach emails/DM
 - [ ] **Configurable thresholds in UI**: `APPLY_THRESHOLD` and
       `OUTREACH_THRESHOLD` are env-only. Expose them as sidebar sliders
       so the user can tune at runtime.
+
+- [ ] **Pre-submit reviewer retry budget**: when the reviewer clears
+      fields, the next autofill pass may re-fill them with the same bad
+      value (LLM determinism + cache). Cap retries at N and skip the
+      whole application when the reviewer keeps flagging the same field.
+- [ ] **Cover-letter critic loop count**: today the critic runs at most
+      once. For French / Spanish letters the first draft sometimes still
+      contains English boilerplate from the prompt — allow up to 2
+      critic passes when the critic flags a language mismatch.
 
 ### Lower priority
 - [ ] **High-confidence auto-send for emails**: optional toggle —
