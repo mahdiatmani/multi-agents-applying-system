@@ -437,27 +437,64 @@ def _prime_profile_lazy_load(page) -> None:
 
     LinkedIn lazy-mounts below-the-fold sections via IntersectionObserver. A
     blind scroll-by-pixel works for About (which is right under the top card)
-    but misses Experience on profiles where About is long — exactly the
-    Kaoutar FAIZ failure mode where About scraped but Experience came back
-    empty.
+    but misses Experience on profiles where About is long.
 
-    Approach: explicitly `scrollIntoView` each target section by its
-    componentkey / id / h2 text, with a 600ms settle between scrolls so React
-    can mount the children. Then return to the top so subsequent top-card
-    button lookups (Connect/Message) still hit the right elements."""
+    Approach: incremental walk down the page until Experience renders with
+    real content (more than just the header word), then return to the top so
+    subsequent top-card button lookups (Connect/Message) still hit the right
+    elements. The walk re-checks Experience after every scroll so it stops
+    as soon as content is visible — instead of guessing fixed offsets and
+    hoping the section loaded."""
+    SETTLE_MS = 350
+    MAX_PIXEL_PASSES = 14   # ~14 * 600px ≈ 8400px — far below most profiles' full height
+    PIXEL_STEP = 600
+
     try:
-        # First: an incremental pre-scroll so React begins mounting things.
-        for offset in (600, 1400, 2400):
-            page.evaluate(f"window.scrollTo({{top: {offset}, behavior: 'auto'}})")
-            page.wait_for_timeout(250)
+        # ── Phase 1: nudge with small scrolls until Experience reports real
+        # content (i.e. more than just the header word). LinkedIn renders the
+        # Experience component on intersection, so each pass gives React a
+        # chance to mount its children. We stop the moment we see real text.
+        for _ in range(MAX_PIXEL_PASSES):
+            try:
+                page.evaluate(f"window.scrollBy(0, {PIXEL_STEP})")
+            except Exception:
+                break
+            page.wait_for_timeout(SETTLE_MS)
+            try:
+                exp = (page.evaluate(_PROFILE_SECTION_JS, "experience") or "").strip()
+            except Exception:
+                exp = ""
+            # Threshold: 60 chars filters out the bare "Experience" header
+            # in any locale and any "see more" affordance text.
+            if exp and len(exp) > 60:
+                break
 
-        # Then: target each section directly. Experience first — it's the field
-        # we care about most for the compatibility decision.
+        # ── Phase 2: targeted scrollIntoView for each section the extractor
+        # uses. Even if Phase 1 succeeded, About + Education still benefit
+        # from being explicitly framed before the extractor reads them.
         for key in ("experience", "about", "education"):
             try:
                 hit = page.evaluate(_SCROLL_SECTION_INTO_VIEW_JS, key)
-                if hit:
-                    page.wait_for_timeout(600)
+                if not hit:
+                    continue
+                page.wait_for_timeout(SETTLE_MS)
+                if key == "experience":
+                    # Hard re-check: scroll-and-recheck up to 4 more times if
+                    # the section is still empty. Some heavy profiles (many
+                    # entries, embedded media) need an extra beat to mount.
+                    for _ in range(4):
+                        try:
+                            exp = (page.evaluate(_PROFILE_SECTION_JS, "experience") or "").strip()
+                        except Exception:
+                            exp = ""
+                        if exp and len(exp) > 60:
+                            break
+                        try:
+                            page.evaluate(_SCROLL_SECTION_INTO_VIEW_JS, "experience")
+                            page.evaluate("window.scrollBy(0, 200)")
+                        except Exception:
+                            break
+                        page.wait_for_timeout(500)
             except Exception:
                 continue
 

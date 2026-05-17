@@ -1,5 +1,6 @@
 import os
 import base64
+import mimetypes
 from email.message import EmailMessage
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -45,10 +46,18 @@ def get_gmail_service():
         print(f"An error occurred: {error}")
         return None
 
-def create_gmail_draft(to_email: str, subject: str, body_text: str) -> tuple[bool, str]:
+def create_gmail_draft(
+    to_email: str,
+    subject: str,
+    body_text: str,
+    attachments: list[str] | None = None,
+) -> tuple[bool, str]:
     """Returns (success, failure_reason). failure_reason is one of:
        '' (success), 'unauthenticated' (no/expired token.json),
-       'http_error: <details>', 'unknown: <details>'."""
+       'http_error: <details>', 'unknown: <details>'.
+
+    attachments: optional list of absolute file paths to attach. Missing or
+    unreadable files are logged and skipped — they never fail the whole draft."""
     service = get_gmail_service()
     if not service:
         msg = "Gmail not authenticated (token.json missing or invalid). Run setup_auth.py."
@@ -61,6 +70,27 @@ def create_gmail_draft(to_email: str, subject: str, body_text: str) -> tuple[boo
         message["To"] = to_email
         message["From"] = "me"
         message["Subject"] = subject
+
+        for path in attachments or []:
+            if not path or not os.path.exists(path):
+                print(f"[Gmail] attachment missing, skipping: {path!r}", flush=True)
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                ctype, _ = mimetypes.guess_type(path)
+                if not ctype:
+                    ctype = "application/octet-stream"
+                maintype, subtype = ctype.split("/", 1)
+                message.add_attachment(
+                    data,
+                    maintype=maintype,
+                    subtype=subtype,
+                    filename=os.path.basename(path),
+                )
+                print(f"[Gmail] attached {os.path.basename(path)} ({len(data)} bytes)", flush=True)
+            except Exception as exc:
+                print(f"[Gmail] failed to attach {path!r}: {exc}", flush=True)
 
         encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
         create_message = {"message": {"raw": encoded_message}}

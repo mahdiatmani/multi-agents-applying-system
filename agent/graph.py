@@ -22,7 +22,7 @@ from tools.playwright_actions import (
     goto_home_feed,
     random_sleep,
 )
-from tools.apply_actions import apply_easy_apply
+from tools.apply_actions import apply_easy_apply, resume_pdf_path
 from tools.gmail_actions import create_gmail_draft
 from tools.history import is_processed, mark_processed
 from tools.post_extractor import POST_CONTAINER_SELECTORS, scrape_post, scrape_feed_via_js
@@ -1226,8 +1226,25 @@ def draft_email_node(state: AgentState) -> dict:
         print(msg, flush=True)
         return {"action_taken": "DRY_RUN_EMAIL", "errors": state.get("errors", []) + [msg]}
 
-    subject = "Application / networking follow-up (via Apply Agent)"
-    success, gmail_reason = create_gmail_draft(to_email, subject, draft_msg)
+    # Subject comes from the LLM (tailored to the post's role/title). Fall back
+    # to a sensible generic only when the model returned nothing.
+    subject = (state.get("draft_subject") or "").strip()
+    if not subject:
+        subject = "Application / networking follow-up (via Apply Agent)"
+
+    # Attach the candidate's CV PDF when available. Resolution matches the
+    # Easy-Apply flow's path so user RESUME_PDF_PATH env var works here too.
+    attachments: list[str] = []
+    try:
+        pdf = resume_pdf_path()
+        if pdf:
+            attachments.append(pdf)
+        else:
+            print("[Email] no CV PDF found to attach (set RESUME_PDF_PATH or drop a .pdf in the project root).", flush=True)
+    except Exception as exc:
+        print(f"[Email] CV resolution failed: {exc}", flush=True)
+
+    success, gmail_reason = create_gmail_draft(to_email, subject, draft_msg, attachments=attachments)
 
     # ALWAYS persist the email decision — even when Gmail fails — so the user can
     # see what the bot wanted to send. With Gmail unauthenticated, the body is

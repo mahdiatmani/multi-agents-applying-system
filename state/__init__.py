@@ -18,6 +18,7 @@ class AgentState(TypedDict, total=False):
     extracted_email: str
     apply_url: str
     draft_message: str
+    draft_subject: str
     action_taken: str
     errors: List[str]
 

@@ -152,6 +152,15 @@ class MatchResult(BaseModel):
     extracted_email: str = Field(default="")
     apply_url: str = Field(default="")
     draft_message: str = Field(default="")
+    draft_subject: str = Field(
+        default="",
+        description=(
+            "Email subject line — filled only when contact_mode is EMAIL. "
+            "Tailored to the role/title from the post (e.g. "
+            "'Application — Junior AI Engineer (Python, LLMs)'). Keep under "
+            "80 chars, no quotes, no emoji. Match the language of the post."
+        ),
+    )
     reasoning: str = Field(default="")
 
     @model_validator(mode="before")
@@ -169,7 +178,7 @@ class MatchResult(BaseModel):
             x["contact_mode"] = up if up in ("EMAIL", "LINK", "DM", "NONE") else "NONE"
         elif cm is None:
             x["contact_mode"] = "NONE"
-        for k in ("extracted_email", "apply_url", "draft_message", "reasoning"):
+        for k in ("extracted_email", "apply_url", "draft_message", "draft_subject", "reasoning"):
             if x.get(k) is None:
                 x[k] = ""
         if x.get("match_score") is None:
@@ -215,10 +224,19 @@ CONTACT MODE (set `contact_mode`) — based on what the post LITERALLY says to d
 DRAFT MESSAGE (only when contact_mode is EMAIL or DM):
 - Match the LANGUAGE of the post.
 - EMAIL: 120-180 words, complete body (greeting + body + sign-off with candidate name from resume).
-  No "Subject" line.
+  Do NOT include a "Subject:" line inside the body — the subject goes in
+  draft_subject. Mention that the CV is attached (since the agent attaches the
+  PDF automatically when sending).
 - DM: 80-120 words, single message, no markdown.
 - Cite the SPECIFIC role/title from the post + 1-2 concrete tech items from the resume.
 - No placeholders like [Name] / [Company]. Fill in actual values.
+
+DRAFT SUBJECT (only when contact_mode is EMAIL):
+- Short, specific, < 80 chars. No quotes, no emoji, no ALL CAPS.
+- Reference the actual role/title from the post (e.g. "Application — Junior
+  AI Engineer (Python, LLMs)" or "Candidature — Stage IA / LLMs").
+- Match the language of the post.
+- If the post mentions a company / lab / team name, include it.
 
 OUTPUT:
 - compatible: true | false
@@ -227,6 +245,7 @@ OUTPUT:
 - extracted_email: address if EMAIL else ""
 - apply_url: url if LINK else ""
 - draft_message: filled if EMAIL or DM, else ""
+- draft_subject: filled if EMAIL, else ""
 - reasoning: 1-2 sentences.
 """
 
@@ -249,6 +268,19 @@ class ProfileMatchResult(BaseModel):
             "'m' (masculine — Monsieur / Mr), 'f' (feminine — Madame / Ms), "
             "'unknown' (truly ambiguous — Sam, Alex, Robin, …). Be decisive for "
             "names with clear gender association in their culture."
+        ),
+    )
+    contact_category: str = Field(
+        default="expert",
+        description=(
+            "Which outreach template to use. One of: "
+            "'hr'     — the profile is an HR / recruiter / talent / hiring-manager / "
+            "           sourcer / people-ops role (RULE 1). They are gatekeepers, "
+            "           so the message asks directly about opportunities. "
+            "'expert' — the profile is a domain professional (engineer, dev, manager, "
+            "           founder, etc.) whose field overlaps the candidate's resume "
+            "           (RULE 2). They are NOT recruiting, so the message asks for "
+            "           advice / orientation instead of pitching directly."
         ),
     )
 
@@ -277,6 +309,15 @@ class ProfileMatchResult(BaseModel):
                 x["gender_guess"] = "unknown"
         else:
             x["gender_guess"] = "unknown"
+        c = x.get("contact_category")
+        if isinstance(c, str):
+            cl = c.strip().lower()
+            if cl in {"hr", "recruiter", "talent", "hiring", "people", "sourcer", "rh"}:
+                x["contact_category"] = "hr"
+            else:
+                x["contact_category"] = "expert"
+        else:
+            x["contact_category"] = "expert"
         return x
 
 
@@ -349,6 +390,16 @@ OUTPUT:
   additional overlap up to +20; -20 only when no overlap AND not HR).
 - draft_message: ALWAYS empty string. The body is generated downstream from a fixed template.
 - reasoning: 1-2 sentences citing matched skills/domain.
+- contact_category: 'hr' | 'expert'.
+   * 'hr'     — the profile is a recruiter / HR / talent / sourcer / hiring
+                manager / people-ops / RH / DRH / staffing role (RULE 1
+                fired). These are gatekeepers; they expect candidate pitches.
+   * 'expert' — the profile is a domain professional (engineer, developer,
+                manager, founder, CTO, researcher, …) whose field overlaps
+                the resume (RULE 2 fired) but who is NOT in a recruiting/HR
+                role. They are NOT recruiting, so we ask for advice / referral
+                instead of pitching directly. DEFAULT to 'expert' when
+                uncertain — the HR template only fits actual HR people.
 - gender_guess: 'm' | 'f' | 'unknown' — inferred from the FIRST name only (ignore the surname).
   Use cultural context: French/Arabic/English/Spanish/etc. name-gender associations are well
   known. BE DECISIVE — 'unknown' is reserved for truly ambiguous unisex names (Sam, Alex,
@@ -388,6 +439,36 @@ _OUTREACH_TEMPLATE_EN = (
     "Thank you in advance for your response."
 )
 
+# Expert / non-HR templates. The candidate isn't pitching the recipient as a
+# hiring gatekeeper — they're asking a domain peer for advice, referrals, or
+# direction. Softer tone, no "send me your CV if you're interested".
+_OUTREACH_TEMPLATE_FR_EXPERT = (
+    "Bonjour {honorific} {name},\n"
+    "\n"
+    "Je suis tombé sur votre profil et je me permets de vous contacter pour "
+    "demander conseil concernant des opportunités dans le domaine de l'IA. "
+    "Je suis actuellement à la recherche d'un stage ou d'un emploi, et je "
+    "voulais savoir si vous connaissiez des opportunités ou si vous pouviez "
+    "m'orienter dans la bonne direction.\n"
+    "\n"
+    "Si besoin, je serais ravi de vous partager mon CV.\n"
+    "\n"
+    "Merci d'avance pour votre temps et votre aide."
+)
+
+_OUTREACH_TEMPLATE_EN_EXPERT = (
+    "Hello {honorific} {name},\n"
+    "\n"
+    "I came across your profile and wanted to reach out for advice regarding "
+    "opportunities in the AI field. I am currently looking for either an "
+    "internship or a job, and I was wondering if you might know of any "
+    "opportunities or could guide me in the right direction.\n"
+    "\n"
+    "If needed, I would be happy to share my CV with you.\n"
+    "\n"
+    "Thank you in advance for your time and help."
+)
+
 # Honorific tables. `unknown` falls back to "Madame" — safer in tone than
 # defaulting to "Monsieur" (mis-addressing a woman as Mr is worse than the
 # reverse in most professional contexts).
@@ -420,17 +501,23 @@ def _first_name_for_greeting(full_name: str) -> str:
     return first
 
 
-def _build_outreach_message(profile: dict, gender: str = "unknown") -> str:
+def _build_outreach_message(
+    profile: dict,
+    gender: str = "unknown",
+    category: str = "hr",
+) -> str:
     """Render the standard outreach template in the right language with the
     recipient's first name + a single honorific (Madame OR Monsieur — never
     both).
 
     Args:
-        profile: dict produced by extract_profile_details — uses `name` and
-                 `primary_lang`.
-        gender:  'm' / 'f' / 'unknown' — the LLM's inferred gender for the
-                 first name. Defaults to 'unknown' which maps to "Madame"
-                 (safer fallback than "Monsieur" in professional contexts).
+        profile:  dict produced by extract_profile_details — uses `name` and
+                  `primary_lang`.
+        gender:   'm' / 'f' / 'unknown' — the LLM's inferred gender for the
+                  first name. Defaults to 'unknown' which maps to "Madame"
+                  (safer fallback than "Monsieur" in professional contexts).
+        category: 'hr' (recruiter/HR/talent — pitches opportunities directly)
+                  or 'expert' (domain peer — asks for advice / orientation).
     """
     lang = (profile.get("primary_lang") or "en").lower()
     if lang not in ("fr", "en"):
@@ -438,7 +525,13 @@ def _build_outreach_message(profile: dict, gender: str = "unknown") -> str:
     g = (gender or "unknown").lower()
     if g not in ("m", "f", "unknown"):
         g = "unknown"
-    template = _OUTREACH_TEMPLATE_FR if lang == "fr" else _OUTREACH_TEMPLATE_EN
+    cat = (category or "hr").lower()
+    if cat not in ("hr", "expert"):
+        cat = "hr"
+    if cat == "expert":
+        template = _OUTREACH_TEMPLATE_FR_EXPERT if lang == "fr" else _OUTREACH_TEMPLATE_EN_EXPERT
+    else:
+        template = _OUTREACH_TEMPLATE_FR if lang == "fr" else _OUTREACH_TEMPLATE_EN
     honorific = _HONORIFICS[lang][g]
     return template.format(
         honorific=honorific,
@@ -446,7 +539,77 @@ def _build_outreach_message(profile: dict, gender: str = "unknown") -> str:
     )
 
 
+# Markers that indicate the role is an internship (regardless of language).
+# Used to skip profiles whose MOST RECENT experience is an internship —
+# interns aren't hiring gatekeepers and can't refer the candidate, so even an
+# HR or skill-overlap match isn't actionable. Matched on word boundaries to
+# avoid false positives like "internal", "international", "interim".
+_INTERN_WORD_PATTERNS = (
+    r"\bintern\b",            # EN: "ML Engineer Intern"
+    r"\binternship\b",        # EN: "· Internship" employment-type tag
+    r"\btrainee\b",           # EN
+    r"\bapprentice\b",        # EN
+    r"\bapprenticeship\b",    # EN
+    r"\bstagiaire\b",         # FR
+    r"\bstage\b",             # FR (employment-type tag)
+    r"\balternance\b",        # FR (alternance / work-study)
+    r"\bapprenti(?:e)?\b",    # FR
+    r"\bbecari[oa]\b",        # ES
+    r"\bprácticas\b",         # ES
+    r"\bpasantía\b",          # ES (LatAm)
+    r"\bpasante\b",           # ES (LatAm)
+    r"\btirocinante\b",       # IT
+    r"\bstagista\b",          # IT
+    r"\btirocinio\b",         # IT
+    r"\bestagiári[oa]\b",     # PT
+    r"\bestágio\b",           # PT
+    r"\bpraktikant(?:in)?\b", # DE
+    r"\bpraktikum\b",         # DE
+    r"\bauszubildende[r]?\b", # DE (apprentice)
+)
+
+
+def _looks_like_intern(text: str) -> bool:
+    """True iff `text` looks like an internship/trainee/apprentice role.
+
+    Used to filter out profiles whose latest experience is just an internship:
+    those people are peers, not gatekeepers, so reaching out has no expected
+    value. Multi-locale on purpose — LinkedIn renders the employment-type tag
+    in the profile's display language, so EN, FR, ES, IT, PT, DE all need to
+    fire."""
+    if not text:
+        return False
+    import re as _re
+    low = text.lower()
+    return any(_re.search(p, low) for p in _INTERN_WORD_PATTERNS)
+
+
 def _eval_profile(state: AgentState, content: str, model_name: str) -> dict:
+    # ── Pre-filter: skip profiles whose LATEST experience is an internship. ──
+    # We check both the parsed `current_role` (e.g. "ML Engineer Intern") AND
+    # the head of the Experience text (covers the "· Internship" / "· Stage"
+    # employment-type tag LinkedIn renders on the company line — that tag is
+    # the clearest "this is an intern role" signal but doesn't land in
+    # current_role, which is just the title line). 240 chars is enough to
+    # cover both lines of the first experience block without bleeding into
+    # the second.
+    profile = state.get("profile_details") or {}
+    current_role = (profile.get("current_role") or "").strip()
+    experience_head = (profile.get("experience") or "")[:240]
+    if _looks_like_intern(current_role) or _looks_like_intern(experience_head):
+        return {
+            "match_score": 0,
+            "reasoning": (
+                f"[intern-only] Latest experience appears to be an internship "
+                f"(role={current_role!r}); skipping — interns can't refer or "
+                "hire."
+            ),
+            "action_taken": "SKIP",
+            "extracted_email": "",
+            "apply_url": "",
+            "draft_message": "",
+        }
+
     llm = _get_llm(model_name)
     resume_text = get_resume_text()
     preferences = (
@@ -490,11 +653,18 @@ def _eval_profile(state: AgentState, content: str, model_name: str) -> dict:
     profile = state.get("profile_details") or {}
     return {
         "match_score": match.match_score,
-        "reasoning": f"[profile-match] {match.reasoning} [gender={match.gender_guess}]",
+        "reasoning": (
+            f"[profile-match] {match.reasoning} "
+            f"[gender={match.gender_guess}] [category={match.contact_category}]"
+        ),
         "action_taken": "NETWORK",
         "extracted_email": "",
         "apply_url": "",
-        "draft_message": _build_outreach_message(profile, gender=match.gender_guess),
+        "draft_message": _build_outreach_message(
+            profile,
+            gender=match.gender_guess,
+            category=match.contact_category,
+        ),
     }
 
 
@@ -672,6 +842,7 @@ def _eval_post(state: AgentState, content: str, model_name: str) -> dict:
         "extracted_email": email,
         "apply_url": apply_url,
         "draft_message": match.draft_message,
+        "draft_subject": (match.draft_subject or "").strip(),
     }
 
 

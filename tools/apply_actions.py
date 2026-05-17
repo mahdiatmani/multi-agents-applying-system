@@ -203,6 +203,11 @@ def _resume_path() -> str | None:
     return None
 
 
+# Public alias — used by outreach modules (draft_email_node) that need the
+# same resume-PDF resolution logic for Gmail attachments.
+resume_pdf_path = _resume_path
+
+
 def _visible(locator) -> bool:
     try:
         return locator.is_visible(timeout=500)
@@ -240,7 +245,32 @@ def _answer_for(label: str, context: dict | None = None) -> str | None:
     job_details = ctx.get("job_details")
     text = label.lower()
     if any(k in text for k in ("years of experience", "years of work experience", "how many years", "years' experience")):
-        return _years_exp()
+        # Only fire for the GENERIC "years of work experience" question. If the
+        # label is qualified with a specific tech / domain / language (e.g.
+        # "...with PySpark", "...in Python", "...using AWS", "...d'expérience
+        # en SQL"), fall through to the LLM so it can honestly answer 0 when
+        # the tech isn't on the resume. Without this guard, the generic
+        # default (often "1") gets returned for any tech, even ones the
+        # candidate has never touched.
+        #
+        # We match qualifier prepositions only on the TAIL of the label —
+        # after the "experience" word — so the " of " in "years of work
+        # experience" doesn't false-trigger. Same for FR "années d'expérience
+        # en SQL" — split at "experience" / "expérience" and scan the tail.
+        import re as _re
+        tail = _re.split(
+            r"experience|expérience|esperienza|experiencia|experiência|erfahrung",
+            text, maxsplit=1,
+        )
+        tail_str = tail[1] if len(tail) > 1 else ""
+        qualifier_markers = (
+            " with ", " in ", " using ", " on ",
+            " avec ", " en ", " utilisant ", " sur ",       # FR
+            " con ", " usando ", " sobre ",                 # ES / IT / PT
+            " mit ",                                        # DE
+        )
+        if not any(m in f" {tail_str} " for m in qualifier_markers):
+            return _years_exp()
     # Phone — require a phone-context word, not bare "mobile" (collides with form labels
     # like "are you mobile to [city]" which is about willingness to relocate, not phones).
     if "phone" in text or "telephone" in text or "téléphone" in text or "telefono" in text:
