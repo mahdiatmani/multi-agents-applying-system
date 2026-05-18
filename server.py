@@ -238,10 +238,12 @@ def detail_from_node(search_type: str, action: str, value: dict) -> dict | None:
         details = value.get("post_details") or {}
         if not details:
             return None
-        # Prefer the actual post permalink (extracted by the JS scraper from the
-        # post's "feed/update/urn:li:activity:..." anchor) over the navigation URL
-        # so "Open on LinkedIn" deep-links to the post, not the home feed.
-        permalink = details.get("post_url") or details.get("source_url") or value.get("current_url", "")
+        # The "Open LinkedIn" link in Profiles/Posts Scanned must deep-link to the
+        # post itself — never to the page the bot was on when it scraped (which,
+        # in the search-bar fallback path, is the search query URL). When no
+        # permalink is available, fall through to the author profile rather than
+        # the search page; final fallback empty so the UI hides the link.
+        permalink = details.get("post_url") or details.get("author_url") or ""
         return {
             "kind": "Post",
             "search_type": search_type,

@@ -232,6 +232,13 @@ FEED_JS_SCRAPER = r"""
 () => {
   const main = document.querySelector('main') || document.body;
   if (!main) return [];
+  // Strip any stale tags left over from a previous scrape pass so per-batch
+  // ids (claude-post-N) stay unambiguous when the DOM partially recycles.
+  try {
+    main.querySelectorAll('[data-claude-post-tag]').forEach(
+      el => el.removeAttribute('data-claude-post-tag')
+    );
+  } catch (e) {}
   // Accessibility delimiters seen between posts. Compared after trim+lowercase.
   const DELIMS = new Set([
     'feed post',
@@ -243,8 +250,35 @@ FEED_JS_SCRAPER = r"""
     '피드 게시물',
     'フィードの投稿', 'フィード投稿',
   ]);
+  // Walk up from a delimiter text node until we hit a likely post-container.
+  // The Playwright fallback uses [data-claude-post-tag="..."] to relocate the
+  // post and open its share dialog, so we want the largest stable ancestor.
+  function findPostRoot(textNode) {
+    let el = textNode.parentElement;
+    for (let depth = 0; el && depth < 14; depth++) {
+      try {
+        const role = el.getAttribute ? el.getAttribute('role') : null;
+        const dataUrn = (el.getAttribute && el.getAttribute('data-urn')) || '';
+        const dataId  = (el.getAttribute && el.getAttribute('data-id')) || '';
+        const cls = (el.className && typeof el.className === 'string') ? el.className : '';
+        if (
+          role === 'article' ||
+          dataUrn.indexOf('urn:li:activity') === 0 ||
+          dataId.indexOf('urn:li:activity') === 0 ||
+          (el.hasAttribute && el.hasAttribute('data-finite-scroll-hotkey-item')) ||
+          cls.indexOf('feed-shared-update-v2') !== -1 ||
+          cls.indexOf('fie-impression-container') !== -1
+        ) {
+          return el;
+        }
+      } catch (e) {}
+      el = el.parentElement;
+    }
+    return null;
+  }
   const posts = [];
   let current = null;
+  let postIdx = 0;
   const walker = document.createTreeWalker(main, NodeFilter.SHOW_ALL, null);
   let node;
   while ((node = walker.nextNode())) {
@@ -254,7 +288,12 @@ FEED_JS_SCRAPER = r"""
       if (!t) continue;
       if (DELIMS.has(t.toLowerCase())) {
         if (current && current.lines.length >= 2) posts.push(current);
-        current = { lines: [], links: [], img_alts: [] };
+        const root = findPostRoot(node);
+        const tag = 'claude-post-' + (postIdx++);
+        if (root) {
+          try { root.setAttribute('data-claude-post-tag', tag); } catch (e) {}
+        }
+        current = { lines: [], links: [], img_alts: [], tag: root ? tag : '' };
         continue;
       }
       if (current) current.lines.push(t);
@@ -269,6 +308,7 @@ FEED_JS_SCRAPER = r"""
   }
   if (current && current.lines.length >= 2) posts.push(current);
   return posts.map(p => ({
+    tag: p.tag || '',
     text: p.lines.join('\n').slice(0, 8000),
     links: Array.from(new Set(p.links)).slice(0, 40),
     img_alts: p.img_alts.slice(0, 10),
@@ -291,10 +331,17 @@ FOOTER_CHROME = {
 
 def _classify_links(links: list[str]) -> dict:
     """Sort a flat list of hrefs into the structured slots the rest of the
-    pipeline expects."""
+    pipeline expects.
+
+    post_url detection covers both LinkedIn permalink formats:
+      - /feed/update/urn:li:activity:<id>   (direct, used inside the feed)
+      - /posts/<author>_<slug>-activity-<id>-<hash>   (public-facing, used in
+        search results and shared links)
+    /feed/update/ is preferred when both appear, since it normalizes cleanly."""
     author_url = ""
     attached_job_url = ""
     post_url = ""
+    post_url_fallback = ""
     seen = set()
     for href in links:
         clean = (href or "").split("#", 1)[0]
@@ -304,6 +351,8 @@ def _classify_links(links: list[str]) -> dict:
         low = clean.lower()
         if "/feed/update/" in low and not post_url:
             post_url = clean.split("?")[0]
+        elif "/posts/" in low and "-activity-" in low and not post_url_fallback:
+            post_url_fallback = clean.split("?")[0]
         elif "/jobs/view/" in low and not attached_job_url:
             attached_job_url = clean.split("?")[0]
         elif ("/in/" in low or "/company/" in low) and not author_url:
@@ -311,7 +360,7 @@ def _classify_links(links: list[str]) -> dict:
     return {
         "author_url": author_url,
         "attached_job_url": attached_job_url,
-        "post_url": post_url,
+        "post_url": post_url or post_url_fallback,
     }
 
 
@@ -389,7 +438,12 @@ def _is_non_post(author: str, content: str) -> bool:
 
 def scrape_feed_via_js(page) -> list[dict]:
     """Use the JS-side scraper to extract every post visible on the page. Returns
-    a list of dicts with author/content/links pre-classified for the agent."""
+    a list of dicts with author/content/links pre-classified for the agent.
+
+    Each dict also carries `dom_tag` — the data-claude-post-tag value the JS
+    scraper stamped onto the post's root element. Callers can relocate the
+    post via `page.locator("[data-claude-post-tag='<tag>']")` and feed it to
+    `resolve_post_url_via_dialog()` when the DOM didn't expose a permalink."""
     try:
         raw = page.evaluate(FEED_JS_SCRAPER) or []
     except Exception as exc:
@@ -414,10 +468,122 @@ def scrape_feed_via_js(page) -> list[dict]:
             "primary_email": emails[0] if emails else "",
             **links_cls,
             "urn": "",  # obfuscated DOM no longer exposes urn
+            "dom_tag": item.get("tag") or "",
         })
     if dropped:
         print(f"[POST] filtered {dropped} non-post cards (suggested/recommended/promoted)", flush=True)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Share-dialog permalink fallback
+# ---------------------------------------------------------------------------
+# When neither /feed/update/ nor /posts/ anchors are present in a post's DOM
+# (common in search results), we click the post's Send button, wait for the
+# share modal, click "Copy link to post" (anchored on its SVG id='link-medium'),
+# and read the URL out of the OS clipboard. No message is sent.
+
+_SEND_BUTTON_SELECTORS = (
+    "button:has(svg[id='send-privately-medium'])",
+    "button:has(svg[id*='send' i])",
+    "button[aria-label*='Send' i]",
+    "button[aria-label*='Envoy' i]",   # FR: Envoyer
+    "button[aria-label*='Enviar' i]",  # ES / PT
+    "button[aria-label*='Senden' i]",  # DE
+    "button[aria-label*='Invia' i]",   # IT
+)
+
+_COPY_LINK_SELECTOR = "button:has(svg[id='link-medium'])"
+
+
+def _find_send_button(post_locator):
+    for sel in _SEND_BUTTON_SELECTORS:
+        try:
+            cand = post_locator.locator(sel).first
+            if _visible(cand, timeout=400):
+                return cand
+        except Exception:
+            continue
+    return None
+
+
+def _close_share_dialog(page) -> None:
+    """Best-effort: dismiss the share modal so the next scrape isn't blocked."""
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+
+def resolve_post_url_via_dialog(page, post_locator, dialog_timeout_ms: int = 4000) -> str:
+    """Open the post's share dialog and capture the canonical permalink from
+    the 'Copy link to post' button. Returns "" on any failure.
+
+    Why: LinkedIn's search-result posts often don't expose a /feed/update/ or
+    /posts/ anchor in the DOM, so DOM scraping comes up empty. The share
+    dialog always produces a permalink, so this is the reliable fallback.
+
+    Side effects: opens (but does NOT submit) the post's share modal; the
+    'Copy link to post' click writes the URL to the OS clipboard. Modal is
+    closed via Escape. Costs ~2-3s of UI interaction per call — callers
+    should budget the number of fallback invocations.
+
+    Requires clipboard-read permission on the browser context (granted on
+    https://www.linkedin.com by agent.browser.BrowserManager).
+    """
+    if post_locator is None:
+        return ""
+    send_btn = _find_send_button(post_locator)
+    if send_btn is None:
+        return ""
+    try:
+        try:
+            send_btn.scroll_into_view_if_needed(timeout=600)
+        except Exception:
+            pass
+        try:
+            send_btn.click(timeout=2500)
+        except Exception:
+            try:
+                send_btn.click(timeout=2500, force=True)
+            except Exception:
+                return ""
+        try:
+            page.wait_for_selector(_COPY_LINK_SELECTOR, timeout=dialog_timeout_ms, state="visible")
+        except Exception:
+            _close_share_dialog(page)
+            return ""
+        copy_btn = page.locator(_COPY_LINK_SELECTOR).first
+        try:
+            copy_btn.click(timeout=2000)
+        except Exception:
+            try:
+                copy_btn.click(timeout=2000, force=True)
+            except Exception:
+                _close_share_dialog(page)
+                return ""
+        # Tiny settle so the clipboard write completes before we read.
+        try:
+            page.wait_for_timeout(180)
+        except Exception:
+            pass
+        url = ""
+        try:
+            url = page.evaluate(
+                "async () => { try { return await navigator.clipboard.readText(); }"
+                " catch (e) { return ''; } }"
+            ) or ""
+        except Exception:
+            url = ""
+        _close_share_dialog(page)
+        url = (url or "").strip()
+        if not url or "linkedin.com" not in url.lower():
+            return ""
+        # Strip tracking query params; keep the canonical path.
+        return url.split("?", 1)[0]
+    except Exception:
+        _close_share_dialog(page)
+        return ""
 
 
 def scrape_post(post) -> dict:

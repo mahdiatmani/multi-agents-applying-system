@@ -25,7 +25,12 @@ from tools.playwright_actions import (
 from tools.apply_actions import apply_easy_apply, resume_pdf_path
 from tools.gmail_actions import create_gmail_draft
 from tools.history import is_processed, mark_processed
-from tools.post_extractor import POST_CONTAINER_SELECTORS, scrape_post, scrape_feed_via_js
+from tools.post_extractor import (
+    POST_CONTAINER_SELECTORS,
+    scrape_post,
+    scrape_feed_via_js,
+    resolve_post_url_via_dialog,
+)
 from tools import pending as pending_db
 from tools import applications as applications_db
 from tools import external_leads
@@ -821,6 +826,45 @@ def _diagnose_feed_state(page) -> None:
         print(f"[POST] diagnostic — screenshot failed: {exc}", flush=True)
 
 
+# Per-batch cap on share-dialog permalink lookups. Each lookup costs ~2-3s of
+# UI interaction (open modal → copy link → read clipboard → Escape), so we
+# bound it to avoid throttling the scrape loop on pathologically link-less
+# pages. Override via env POST_DIALOG_PERMALINK_BUDGET.
+DIALOG_PERMALINK_BUDGET_PER_BATCH = int(os.getenv("POST_DIALOG_PERMALINK_BUDGET", "8"))
+
+
+def _resolve_missing_permalinks(page, scraped_posts: list[dict]) -> None:
+    """For each scraped post still missing post_url, locate it via its JS-stamped
+    [data-claude-post-tag="..."] anchor and capture the permalink from the
+    share dialog. Mutates the scraped dicts in place. Bounded by
+    DIALOG_PERMALINK_BUDGET_PER_BATCH."""
+    if DIALOG_PERMALINK_BUDGET_PER_BATCH <= 0:
+        return
+    remaining = DIALOG_PERMALINK_BUDGET_PER_BATCH
+    for scraped in scraped_posts:
+        if remaining <= 0:
+            break
+        if scraped.get("post_url"):
+            continue
+        tag = scraped.get("dom_tag")
+        if not tag:
+            continue
+        try:
+            post_loc = page.locator(f"[data-claude-post-tag='{tag}']").first
+            try:
+                if not post_loc.is_visible(timeout=300):
+                    continue
+            except Exception:
+                continue
+            url = resolve_post_url_via_dialog(page, post_loc)
+            if url:
+                scraped["post_url"] = url
+                remaining -= 1
+                print(f"[POST] resolved permalink via share dialog: {url}", flush=True)
+        except Exception as exc:
+            print(f"[POST] dialog permalink lookup failed for tag={tag!r}: {exc}", flush=True)
+
+
 def _scrape_feed_batch(page, search_url: str, target: int) -> list[dict]:
     """Scroll the feed until ~target new posts are scraped (or the scroll budget
     runs out). Returns a list of post-detail dicts ready for evaluation. Deduped
@@ -837,6 +881,11 @@ def _scrape_feed_batch(page, search_url: str, target: int) -> list[dict]:
             # in case the JS scraper also failed to find Like-button anchors.
             _collect_post_locators(page)
             _diagnose_feed_state(page)
+
+        # Backfill permalinks for posts whose DOM didn't expose /feed/update/
+        # or /posts/ anchors — covers search-result posts where the share
+        # dialog is the only reliable URL source.
+        _resolve_missing_permalinks(page, scraped_posts)
 
         for scraped in scraped_posts:
             try:
@@ -1261,7 +1310,11 @@ def draft_email_node(state: AgentState) -> dict:
             subject=subject,
             body=draft_msg,
             post_author=post.get("author") or "",
-            post_url=post.get("post_url") or post.get("source_url") or "",
+            # post_url MUST be the post's own permalink — never the page we
+            # found it on (search query / home feed). When the scraper failed
+            # to pull a permalink, leave it empty rather than linking to a
+            # search-results page.
+            post_url=post.get("post_url") or "",
             post_excerpt=(post.get("content") or "")[:500],
             match_score=state.get("match_score"),
             status=record_status,
@@ -1393,7 +1446,11 @@ def external_link_node(state: AgentState) -> dict:
         added = apply_link.record_link(
             apply_url=apply_url,
             post_author=post.get("author") or "",
-            post_url=post.get("post_url") or post.get("source_url") or "",
+            # post_url MUST be the post's own permalink — never the page we
+            # found it on (search query / home feed). When the scraper failed
+            # to pull a permalink, leave it empty rather than linking to a
+            # search-results page.
+            post_url=post.get("post_url") or "",
             post_excerpt=(post.get("content") or "")[:500],
             match_score=state.get("match_score"),
         )

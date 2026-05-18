@@ -147,6 +147,18 @@ class BrowserManager:
 
         self.context: BrowserContext = self.browser.new_context(**context_args)
 
+        # Clipboard read/write is required for the post-permalink fallback in
+        # tools/post_extractor.resolve_post_url_via_dialog — it clicks LinkedIn's
+        # 'Copy link to post' button in the share dialog and reads the URL back
+        # via navigator.clipboard.readText(). Granted only on linkedin.com.
+        try:
+            self.context.grant_permissions(
+                ["clipboard-read", "clipboard-write"],
+                origin="https://www.linkedin.com",
+            )
+        except Exception as exc:
+            print(f"[BrowserManager] clipboard permission grant failed: {exc}", flush=True)
+
         self.context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => undefined
