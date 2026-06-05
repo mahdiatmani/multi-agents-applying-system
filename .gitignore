@@ -1,0 +1,70 @@
+# ── Secrets & PII (NEVER COMMIT) ────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+credentials.json
+token.json
+client_secret*.json
+google-credentials*.json
+
+# Personal CV / resume documents
+CV.txt
+*.pdf
+
+# Generated cover letters (per-application PDFs)
+cover-letters/
+
+# Notes that aren't source code
+wheres.txt
+
+# ── Persistent runtime state (sessions, cookies, personal activity) ─────────
+# Keep the state/ Python module (state/__init__.py) but ignore all data files
+state/*.json
+state/errors/
+state/logs/
+state/backups/
+state/applications.json
+state/__pycache__/
+state/debug/
+state/incidents/
+state/self_heal/
+
+# ── Large media / local screenshots ─────────────────────────────────────────
+*.mp4
+*.mov
+*.avi
+localhost_*.png
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ── Node / frontend build ───────────────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+node_modules/
+npm-debug.log*
+
+# ── IDE / OS noise ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Local Claude Code config ────────────────────────────────────────────────
+.claude/
+
+# ── Logs ────────────────────────────────────────────────────────────────────
+*.log
